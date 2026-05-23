@@ -60,6 +60,7 @@ WAKE_TRANSCRIBE_PROVIDER=groq
 WAKE_ENERGY_THRESHOLD=0.012
 WAKE_MAX_RECORD_SECONDS=12
 WAKE_SILENCE_SECONDS=1.0
+WAKE_PHRASE_SILENCE_SECONDS=3.0
 WAKE_COMMAND_DELAY_SECONDS=2.0
 WAKE_COMMAND_MAX_SECONDS=12
 ```
@@ -108,3 +109,16 @@ Two-step wake mode:
 The first phrase is used only to detect the wake word. The command is recorded
 after `WAKE_COMMAND_DELAY_SECONDS`, so the command itself does not need to
 repeat the wake word.
+
+In practice, because the listener only knows that you said the wake word after
+speech-to-text finishes, the preferred mode is to keep the whole utterance in
+one recording:
+
+```text
+джарвис
+...pause up to WAKE_PHRASE_SILENCE_SECONDS...
+сделай заметку Иван предпочитает созвоны после 14:00
+```
+
+Use `WAKE_PHRASE_SILENCE_SECONDS=3.0` so a two-second pause after the wake word
+does not split the recording too early.

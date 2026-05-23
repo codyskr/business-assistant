@@ -25,6 +25,12 @@ MAX_RECORD_SECONDS = float(os.getenv("WAKE_MAX_RECORD_SECONDS", "12"))
 SILENCE_SECONDS = float(os.getenv("WAKE_SILENCE_SECONDS", "1.0"))
 WAKE_COMMAND_DELAY_SECONDS = float(os.getenv("WAKE_COMMAND_DELAY_SECONDS", "2.0"))
 WAKE_COMMAND_MAX_SECONDS = float(os.getenv("WAKE_COMMAND_MAX_SECONDS", str(MAX_RECORD_SECONDS)))
+WAKE_PHRASE_SILENCE_SECONDS = float(
+    os.getenv(
+        "WAKE_PHRASE_SILENCE_SECONDS",
+        str(max(SILENCE_SECONDS, WAKE_COMMAND_DELAY_SECONDS + 0.8)),
+    )
+)
 WAKE_WORDS = [
     word.strip().lower()
     for word in os.getenv("WAKE_WORDS", "ассистент,помощник").split(",")
@@ -419,8 +425,11 @@ def listen_forever() -> None:
     print(f"Wake words: {', '.join(WAKE_WORDS)}")
     print(f"STT provider after voice trigger: {WAKE_TRANSCRIBE_PROVIDER}")
     print(f"Input device: {input_device}")
-    print(f"Sample rate: {SAMPLE_RATE}, threshold: {ENERGY_THRESHOLD}")
-    print("Say the wake word, pause, then say the command.")
+    print(
+        f"Sample rate: {SAMPLE_RATE}, threshold: {ENERGY_THRESHOLD}, "
+        f"phrase silence: {WAKE_PHRASE_SILENCE_SECONDS}"
+    )
+    print("Say the wake word, pause up to phrase silence, then say the command.")
 
     recording = False
     frames: list[bytes] = []
@@ -454,7 +463,7 @@ def listen_forever() -> None:
                 silence = now - last_voice_at
                 if (
                     elapsed >= MIN_RECORD_SECONDS
-                    and silence >= SILENCE_SECONDS
+                    and silence >= WAKE_PHRASE_SILENCE_SECONDS
                 ) or elapsed >= MAX_RECORD_SECONDS:
                     recording = False
                     try:
