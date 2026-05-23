@@ -1805,6 +1805,8 @@ def capabilities_text(section: str = "main") -> str:
                 "3. Голос: принимать голосовые и превращать их в задачи.",
                 "4. Память: хранить локальный зашифрованный контекст.",
                 "5. Действия: показывать последние выполненные операции.",
+                "6. Заметки: сохранять короткие шифрованные заметки и искать их по смыслу.",
+                "7. База знаний: добавлять файлы и искать ответы по их содержимому.",
             ]
         ),
         "calendar": "\n".join(
@@ -1855,6 +1857,20 @@ def capabilities_text(section: str = "main") -> str:
                 "Заметки хранятся локально в data/notes.jsonl и шифруются.",
             ]
         ),
+        "knowledge": "\n".join(
+            [
+                "База знаний:",
+                "- пришли файл в Telegram, и я добавлю его в локальную базу знаний",
+                "- поддержка: txt, md, csv, json, yaml, log, html, xml, pdf, docx",
+                "- /kb — список загруженных файлов",
+                "- /kb договор с Иваном — поиск по базе знаний",
+                "- /knowledge регламент оплаты — то же самое",
+                "- найди в базе знаний про условия договора",
+                "- покажи в документах про отчет",
+                "Как хранится: data/knowledge.jsonl, каждый фрагмент зашифрован локальным Fernet-ключом.",
+                "Как ищет: быстрый локальный fuzzy-поиск + локальная Ollama-реранжировка, если включена.",
+            ]
+        ),
         "memory": "\n".join(
             [
                 "Память и контроль:",
@@ -1886,6 +1902,7 @@ def capabilities_keyboard() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton("Заметки", callback_data="help:notes"),
+                InlineKeyboardButton("База знаний", callback_data="help:knowledge"),
             ],
         ]
     )
@@ -3626,6 +3643,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "voice": "voice",
         "голос": "voice",
         "memory": "memory",
+        "knowledge": "knowledge",
+        "kb": "knowledge",
+        "база": "knowledge",
+        "база_знаний": "knowledge",
         "notes": "notes",
         "заметки": "notes",
         "заметка": "notes",
@@ -4503,7 +4524,7 @@ def main() -> None:
     app.add_handler(CommandHandler("debuglog", debug_log))
     app.add_handler(CommandHandler("privacy", privacy_status))
     app.add_handler(CommandHandler("stt", stt_status))
-    app.add_handler(CallbackQueryHandler(handle_help_callback, pattern=r"^help:(calendar|reminders|voice|memory|notes)$"))
+    app.add_handler(CallbackQueryHandler(handle_help_callback, pattern=r"^help:(calendar|reminders|voice|memory|notes|knowledge)$"))
     app.add_handler(CallbackQueryHandler(handle_event_selection, pattern=r"^event_select:\d+$"))
     app.add_handler(CallbackQueryHandler(handle_reminder_selection, pattern=r"^reminder_select:\d+$"))
     app.add_handler(CallbackQueryHandler(handle_reminder_delete_scope, pattern=r"^reminder_delete_scope:(today|tomorrow|date|all)$"))
