@@ -27,6 +27,7 @@ WAKE_WORDS = [
     for word in os.getenv("WAKE_WORDS", "ассистент,помощник").split(",")
     if word.strip()
 ]
+WAKE_INPUT_DEVICE = os.getenv("WAKE_INPUT_DEVICE", "").strip()
 LOCAL_COMMAND_URL = os.getenv("LOCAL_COMMAND_URL", "http://127.0.0.1:8765/command")
 LOCAL_COMMAND_TOKEN = os.getenv("LOCAL_COMMAND_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("WAKE_TELEGRAM_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID", "")
@@ -57,6 +58,45 @@ def import_audio_deps():
             "pip install -r voice_listener_requirements.txt"
         ) from exc
     return np, sd
+
+
+def resolve_input_device(sd):
+    if WAKE_INPUT_DEVICE:
+        try:
+            return int(WAKE_INPUT_DEVICE)
+        except ValueError:
+            return WAKE_INPUT_DEVICE
+
+    default_input = sd.default.device[0]
+    try:
+        sd.check_input_settings(
+            device=default_input,
+            channels=CHANNELS,
+            samplerate=SAMPLE_RATE,
+            dtype="int16",
+        )
+        return default_input
+    except Exception:
+        pass
+
+    for index, device in enumerate(sd.query_devices()):
+        if device.get("max_input_channels", 0) <= 0:
+            continue
+        try:
+            sd.check_input_settings(
+                device=index,
+                channels=CHANNELS,
+                samplerate=SAMPLE_RATE,
+                dtype="int16",
+            )
+            return index
+        except Exception:
+            continue
+
+    raise RuntimeError(
+        f"No input device supports {SAMPLE_RATE} Hz mono int16. "
+        "Set WAKE_INPUT_DEVICE to one of the input device indexes."
+    )
 
 
 def rms(np, chunk) -> float:
@@ -137,6 +177,7 @@ async def handle_recording(frames: list[bytes]) -> None:
 def listen_forever() -> None:
     require_settings()
     np, sd = import_audio_deps()
+    input_device = resolve_input_device(sd)
     audio_queue: queue.Queue = queue.Queue()
 
     def callback(indata, frames, time_info, status) -> None:
@@ -146,6 +187,7 @@ def listen_forever() -> None:
 
     print("Laptop voice listener started.")
     print(f"Wake words: {', '.join(WAKE_WORDS)}")
+    print(f"Input device: {input_device}")
     print("Speak the wake word and command in one phrase.")
 
     recording = False
@@ -154,6 +196,7 @@ def listen_forever() -> None:
     last_voice_at = 0.0
 
     with sd.InputStream(
+        device=input_device,
         samplerate=SAMPLE_RATE,
         channels=CHANNELS,
         dtype="int16",

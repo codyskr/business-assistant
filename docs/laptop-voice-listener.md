@@ -19,6 +19,7 @@ LOCAL_COMMAND_PORT=8765
 LOCAL_COMMAND_TOKEN=change_me
 LOCAL_COMMAND_URL=http://127.0.0.1:8765/command
 WAKE_WORDS=ассистент,помощник
+WAKE_INPUT_DEVICE=
 WAKE_TELEGRAM_CHAT_ID=123456789
 WAKE_TELEGRAM_USER_ID=123456789
 ```
@@ -53,10 +54,15 @@ Say the wake word and command in one phrase:
 Tuning:
 
 ```env
+WAKE_INPUT_DEVICE=26
 WAKE_ENERGY_THRESHOLD=0.012
 WAKE_MAX_RECORD_SECONDS=12
 WAKE_SILENCE_SECONDS=1.0
 ```
+
+Leave `WAKE_INPUT_DEVICE` empty for auto-detection. If the listener cannot open
+the default microphone, set it to one of the input device indexes printed by the
+diagnostic command or by the listener startup output.
 
 Raise `WAKE_ENERGY_THRESHOLD` if it triggers on noise. Lower it if it misses
 your voice.
