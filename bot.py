@@ -5,8 +5,6 @@ import mimetypes
 import os
 import sqlite3
 import tempfile
-import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -87,11 +85,6 @@ MEMORY_RECENT_MESSAGES = int(os.getenv("MEMORY_RECENT_MESSAGES", "12"))
 MEMORY_RECENT_ACTIONS = int(os.getenv("MEMORY_RECENT_ACTIONS", "6"))
 
 GOOGLE_SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
-
-LOCAL_COMMAND_ENABLED = os.getenv("LOCAL_COMMAND_ENABLED", "false").lower() == "true"
-LOCAL_COMMAND_HOST = os.getenv("LOCAL_COMMAND_HOST", "127.0.0.1")
-LOCAL_COMMAND_PORT = int(os.getenv("LOCAL_COMMAND_PORT", "8765"))
-LOCAL_COMMAND_TOKEN = os.getenv("LOCAL_COMMAND_TOKEN", "")
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -2855,168 +2848,6 @@ async def handle_text(
     )
 
 
-class ChatReplyTarget:
-    def __init__(self, app: Application, chat_id: int) -> None:
-        self.app = app
-        self.chat_id = chat_id
-
-    async def reply_text(self, text: str, **kwargs: Any) -> Any:
-        return await self.app.bot.send_message(
-            chat_id=self.chat_id,
-            text=text,
-            **kwargs,
-        )
-
-
-async def process_external_text(
-    text: str,
-    *,
-    chat_id: int,
-    user_id: int,
-    app: Application,
-    source: str = "local_voice",
-    stt_provider: str | None = "local",
-) -> None:
-    reply_target = ChatReplyTarget(app, chat_id)
-    debug_id = store.add_debug_log(
-        chat_id=chat_id,
-        user_id=user_id,
-        source=source,
-        stt_provider=stt_provider,
-        input_text=text,
-    )
-    store.add_memory_message(chat_id=chat_id, user_id=user_id, role="user", text=text)
-
-    try:
-        await app.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-    except Exception:
-        logger.warning("Could not send typing action for external text", exc_info=True)
-
-    if is_capabilities_question(text):
-        reply = capabilities_text()
-        store.update_debug_log(debug_id, intent_kind="capabilities", result="replied")
-        await safe_reply_text(reply_target, reply, reply_markup=capabilities_keyboard())
-        store.add_memory_message(chat_id=chat_id, user_id=None, role="assistant", text=reply)
-        return
-
-    if await maybe_handle_notes(
-        text,
-        chat_id=chat_id,
-        user_id=user_id,
-        reply_target=reply_target,
-        debug_id=debug_id,
-    ):
-        return
-
-    reminder_range = reminder_range_from_text(text)
-    if reminder_range:
-        title, start, end = reminder_range
-        export_reminders_markdown(chat_id)
-        reply = format_reminders_for_range(chat_id, title, start, end)
-        store.update_debug_log(debug_id, intent_kind="reminder_list", result="replied")
-        await safe_reply_text(reply_target, reply)
-        store.add_memory_message(chat_id=chat_id, user_id=None, role="assistant", text=reply)
-        return
-
-    calendar_range = infer_calendar_list_range(text)
-    if calendar_range:
-        title, start, end = calendar_range
-        try:
-            events = await list_calendar_events(start, end, user_id=user_id)
-            reply = format_calendar_events(events, title)
-            store.update_debug_log(debug_id, intent_kind="calendar_list", result="replied")
-        except Exception as exc:
-            logger.exception("Calendar listing failed")
-            reply = f"Не получилось прочитать календарь: {exc}"
-            store.update_debug_log(
-                debug_id,
-                intent_kind="calendar_list",
-                result="error",
-                error=str(exc),
-            )
-        await safe_reply_text(reply_target, reply)
-        store.add_memory_message(chat_id=chat_id, user_id=None, role="assistant", text=reply)
-        return
-
-    task_reminder = (
-        infer_delete_reminders(text)
-        or infer_delete_all_calendar_events(text)
-        or infer_recurring_calendar_events(text)
-        or infer_hourly_countdown_reminders(text)
-        or infer_general_recurring_reminders(text)
-        or infer_recurring_task_reminders(text)
-        or infer_direct_reminder(text)
-        or infer_task_reminder(text)
-    )
-    if task_reminder:
-        intent = ParsedIntent(
-            kind="reminder",
-            data=task_reminder,
-            reply=task_reminder["reply"],
-        )
-    else:
-        try:
-            intent = await ask_ollama_for_intent(text, chat_id)
-        except httpx.RequestError:
-            store.update_debug_log(debug_id, result="error", error="ollama_request_error")
-            await safe_reply_text(reply_target, "Не могу подключиться к Ollama. Проверьте, что ollama serve запущен.")
-            return
-        except Exception as exc:
-            logger.exception("External intent parsing failed")
-            store.update_debug_log(debug_id, result="error", error=str(exc))
-            await safe_reply_text(reply_target, "Не смог разобрать запрос. Попробуйте сказать проще и с датой/временем.")
-            return
-
-    if intent.kind in {
-        "calendar_event",
-        "reminder",
-        "recurring_reminders",
-        "recurring_calendar_events",
-        "delete_calendar_event",
-        "delete_reminders",
-        "reschedule_calendar_event",
-    }:
-        action_summary = format_action(intent.data)
-        store.update_debug_log(
-            debug_id,
-            intent_kind=intent.kind,
-            intent_payload=intent.data,
-            result="auto_confirm_execute" if AUTO_CONFIRM_ACTIONS else "pending_confirmation",
-        )
-        store.add_action_history(chat_id, intent.kind, action_summary, intent.data)
-        if AUTO_CONFIRM_ACTIONS:
-            await execute_action(
-                intent.data,
-                chat_id=chat_id,
-                user_id=user_id,
-                app=app,
-                reply_target=reply_target,
-            )
-            return
-
-        action_id = store.add_pending(chat_id=chat_id, user_id=user_id, action=intent.data)
-        keyboard = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton("Подтвердить", callback_data=f"confirm:{action_id}"),
-                    InlineKeyboardButton("Отмена", callback_data=f"cancel:{action_id}"),
-                ]
-            ]
-        )
-        await safe_reply_text(reply_target, action_summary, reply_markup=keyboard)
-        store.add_memory_message(chat_id=chat_id, user_id=None, role="assistant", text=action_summary)
-        return
-
-    store.update_debug_log(
-        debug_id,
-        intent_kind=intent.kind,
-        intent_payload=intent.data,
-        result="chat_reply",
-    )
-    await safe_reply_text(reply_target, intent.reply)
-    store.add_memory_message(chat_id=chat_id, user_id=None, role="assistant", text=intent.reply)
-
-
 async def execute_action(
     parsed: dict[str, Any],
     chat_id: int,
@@ -4065,96 +3896,6 @@ async def stt_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await safe_reply_text(update.message, "\n".join(lines))
 
 
-def start_local_command_server(app: Application) -> ThreadingHTTPServer | None:
-    if not LOCAL_COMMAND_ENABLED:
-        return None
-
-    loop = asyncio.get_running_loop()
-
-    class LocalCommandHandler(BaseHTTPRequestHandler):
-        def log_message(self, format: str, *args: Any) -> None:
-            logger.info("local-command: " + format, *args)
-
-        def send_json(self, status: int, payload: dict[str, Any]) -> None:
-            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def do_GET(self) -> None:
-            if self.path == "/health":
-                self.send_json(200, {"ok": True})
-                return
-            self.send_json(404, {"ok": False, "error": "not_found"})
-
-        def do_POST(self) -> None:
-            if self.path != "/command":
-                self.send_json(404, {"ok": False, "error": "not_found"})
-                return
-
-            if LOCAL_COMMAND_TOKEN:
-                auth = self.headers.get("Authorization", "")
-                token = self.headers.get("X-Local-Command-Token", "")
-                if auth != f"Bearer {LOCAL_COMMAND_TOKEN}" and token != LOCAL_COMMAND_TOKEN:
-                    self.send_json(401, {"ok": False, "error": "unauthorized"})
-                    return
-
-            try:
-                length = int(self.headers.get("Content-Length", "0"))
-                payload = json.loads(self.rfile.read(length).decode("utf-8"))
-                text = str(payload["text"]).strip()
-                chat_id = int(payload["chat_id"])
-                user_id = int(payload["user_id"])
-                source = str(payload.get("source", "local_voice"))
-            except Exception as exc:
-                self.send_json(400, {"ok": False, "error": f"bad_request: {exc}"})
-                return
-
-            if not text:
-                self.send_json(400, {"ok": False, "error": "empty_text"})
-                return
-            if ALLOWED_TELEGRAM_USER_IDS and user_id not in ALLOWED_TELEGRAM_USER_IDS:
-                self.send_json(403, {"ok": False, "error": "user_not_allowed"})
-                return
-
-            future = asyncio.run_coroutine_threadsafe(
-                process_external_text(
-                    text,
-                    chat_id=chat_id,
-                    user_id=user_id,
-                    app=app,
-                    source=source,
-                    stt_provider="local",
-                ),
-                loop,
-            )
-
-            def log_result(done: Any) -> None:
-                try:
-                    done.result()
-                except Exception:
-                    logger.exception("Local command processing failed")
-
-            future.add_done_callback(log_result)
-            self.send_json(202, {"ok": True, "status": "accepted"})
-
-    server = ThreadingHTTPServer((LOCAL_COMMAND_HOST, LOCAL_COMMAND_PORT), LocalCommandHandler)
-    thread = threading.Thread(
-        target=server.serve_forever,
-        name="local-command-server",
-        daemon=True,
-    )
-    thread.start()
-    logger.info(
-        "Local command server listening on http://%s:%s",
-        LOCAL_COMMAND_HOST,
-        LOCAL_COMMAND_PORT,
-    )
-    return server
-
-
 async def post_init(app: Application) -> None:
     for row in store.list_pending_reminders():
         remind_at = parse_dt(row["remind_at"])
@@ -4169,7 +3910,6 @@ async def post_init(app: Application) -> None:
             str(row["remind_at"]),
         )
     scheduler.start()
-    start_local_command_server(app)
 
 
 def main() -> None:

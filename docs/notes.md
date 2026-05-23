@@ -29,11 +29,3 @@ Show recent notes:
 ```text
 /notes
 ```
-
-Laptop wake flow:
-
-```text
-джарвис
-...pause...
-сделай заметку Иван предпочитает созвоны после 14:00
-```
