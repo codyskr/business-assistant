@@ -1,0 +1,8 @@
+python-telegram-bot==21.11.1
+httpx==0.28.1
+python-dotenv==1.0.1
+apscheduler==3.10.4
+faster-whisper==1.1.1
+google-api-python-client==2.160.0
+google-auth-oauthlib==1.2.1
+cryptography==44.0.0
