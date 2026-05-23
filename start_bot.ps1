@@ -1,5 +1,6 @@
 param(
-    [switch]$RunBotInWsl
+    [switch]$RunBotInWsl,
+    [switch]$VoiceListen
 )
 
 $ErrorActionPreference = "Stop"
@@ -154,6 +155,25 @@ function Start-BotWindows {
     & ".\.venv\Scripts\python.exe" bot.py
 }
 
+function Start-VoiceListenerWindows {
+    if (-not (Test-Path ".venv\Scripts\python.exe")) {
+        Write-Host "Creating Windows virtual environment..."
+        python -m venv .venv
+    }
+
+    Write-Host "Installing Python dependencies for voice listener..."
+    & ".\.venv\Scripts\python.exe" -m pip install -r requirements.txt
+    & ".\.venv\Scripts\python.exe" -m pip install -r voice_listener_requirements.txt
+
+    Write-Host "Starting laptop voice listener in a separate window..."
+    Start-Process powershell.exe -ArgumentList @(
+        "-NoExit",
+        "-ExecutionPolicy", "Bypass",
+        "-Command",
+        "cd '$PSScriptRoot'; .\.venv\Scripts\python.exe voice_listener.py"
+    )
+}
+
 function Start-BotWsl {
     $wslPath = Convert-ToWslPath -WindowsPath $PSScriptRoot
     $command = @"
@@ -187,6 +207,10 @@ if (-not (Test-OllamaApi -Url $ollamaUrl)) {
 
 Ensure-OllamaModel -Model $ollamaModel -UseWsl:$usingWslOllama
 Warm-OllamaModel -Url $ollamaUrl -Model $ollamaModel
+
+if ($VoiceListen) {
+    Start-VoiceListenerWindows
+}
 
 if ($RunBotInWsl) {
     Start-BotWsl
