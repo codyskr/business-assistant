@@ -35,6 +35,7 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = DATA_DIR / "agent.db"
 REMINDERS_MD_PATH = DATA_DIR / "reminders.md"
+NOTES_PATH = DATA_DIR / "notes.jsonl"
 CREDENTIALS_PATH = BASE_DIR / "credentials.json"
 TOKEN_PATH = BASE_DIR / "token.json"
 GOOGLE_TOKENS_DIR = DATA_DIR / "google_tokens"
@@ -657,6 +658,148 @@ def decrypt_text(cipher: str) -> str:
     if _fernet is None:
         _fernet = get_fernet()
     return _fernet.decrypt(cipher.encode("ascii")).decode("utf-8")
+
+
+def normalize_search_text(text: str) -> str:
+    import re
+
+    return " ".join(re.findall(r"[a-zA-Zа-яА-ЯёЁ0-9]+", text.lower()))
+
+
+def note_score(query: str, note_text: str) -> int:
+    query_norm = normalize_search_text(query)
+    text_norm = normalize_search_text(note_text)
+    if not query_norm:
+        return 0
+    if not text_norm:
+        return 0
+    if fuzz is not None:
+        return int(max(fuzz.partial_ratio(query_norm, text_norm), fuzz.token_set_ratio(query_norm, text_norm)))
+
+    query_words = set(query_norm.split())
+    text_words = set(text_norm.split())
+    if not query_words:
+        return 0
+    return int(len(query_words & text_words) / len(query_words) * 100)
+
+
+def add_note(chat_id: int, user_id: int | None, text: str) -> dict[str, Any]:
+    NOTES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    note = {
+        "id": f"note-{int(datetime.now(ZoneInfo(TIMEZONE)).timestamp() * 1000)}",
+        "chat_id": chat_id,
+        "user_id": user_id,
+        "text": text.strip(),
+        "created_at": now_iso(),
+    }
+    line = json.dumps(
+        {
+            "v": 1,
+            "cipher": encrypt_text(json.dumps(note, ensure_ascii=False)),
+        },
+        ensure_ascii=False,
+    )
+    with NOTES_PATH.open("a", encoding="utf-8") as file:
+        file.write(line + "\n")
+    return note
+
+
+def iter_notes(chat_id: int, user_id: int | None = None) -> list[dict[str, Any]]:
+    if not NOTES_PATH.exists():
+        return []
+
+    notes: list[dict[str, Any]] = []
+    with NOTES_PATH.open("r", encoding="utf-8") as file:
+        for line in file:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                wrapper = json.loads(line)
+                note = json.loads(decrypt_text(str(wrapper["cipher"])))
+            except Exception:
+                logger.warning("Could not decrypt note line", exc_info=True)
+                continue
+            if int(note.get("chat_id", 0)) != chat_id:
+                continue
+            if user_id is not None and note.get("user_id") not in (None, user_id):
+                continue
+            notes.append(note)
+    return notes
+
+
+def search_notes(chat_id: int, query: str, user_id: int | None = None, limit: int = 5) -> list[dict[str, Any]]:
+    ranked = []
+    for note in iter_notes(chat_id, user_id):
+        score = note_score(query, str(note.get("text", "")))
+        if score >= 35:
+            ranked.append((score, note))
+    ranked.sort(key=lambda item: (item[0], item[1].get("created_at", "")), reverse=True)
+    return [note | {"score": score} for score, note in ranked[:limit]]
+
+
+def infer_note_create(text: str) -> str | None:
+    import re
+
+    lowered = text.lower()
+    patterns = (
+        r"(?:сделай|создай|запиши|добавь|сохрани)\s+заметк[ауи]\s*[:\-—,]?\s*(.+)",
+        r"заметк[аи]\s*[:\-—,]\s*(.+)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
+        if match:
+            note_text = match.group(1).strip(" \n\t:;-—")
+            return note_text or None
+    if lowered.strip() in {"сделай заметку", "создай заметку", "запиши заметку"}:
+        return ""
+    return None
+
+
+def infer_note_query(text: str) -> str | None:
+    import re
+
+    lowered = text.lower()
+    if not any(word in lowered for word in ("заметк", "записывал", "записано", "сохранял")):
+        return None
+    if any(word in lowered for word in ("сделай замет", "создай замет", "запиши замет", "добавь замет", "сохрани замет")):
+        return None
+
+    patterns = (
+        r"(?:найди|покажи|достань|открой)\s+заметк\w*\s+(?:про|о|об|по)?\s*(.+)",
+        r"(?:что|какие|какая)\s+(?:у меня\s+)?(?:есть\s+)?(?:в\s+)?заметк\w*\s+(?:про|о|об|по)?\s*(.+)",
+        r"(?:что\s+)?(?:я\s+)?записывал\s+(?:про|о|об|по)?\s*(.+)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
+        if match:
+            query = match.group(1).strip(" \n\t:;?.!-—")
+            return query or None
+    if "замет" in lowered:
+        return lowered.replace("заметки", "").replace("заметку", "").replace("заметка", "").strip(" \n\t:;?.!-—") or None
+    return None
+
+
+def format_note_created(note: dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            "Заметка сохранена.",
+            f"Когда: {format_msk_dt(note['created_at'])}",
+            f"Текст: {note['text']}",
+        ]
+    )
+
+
+def format_note_results(query: str, notes: list[dict[str, Any]]) -> str:
+    if not notes:
+        return f"Не нашел подходящих заметок по запросу: {query}"
+
+    lines = [f"Нашел заметки по запросу: {query}"]
+    for index, note in enumerate(notes, start=1):
+        lines.append(
+            f"{index}. {format_msk_dt(note['created_at'])} — {note['text']}"
+        )
+    return "\n".join(lines)
 
 
 store = Store(DB_PATH)
@@ -1283,6 +1426,17 @@ def capabilities_text(section: str = "main") -> str:
                 "- дальше обработаю как текстовую задачу",
             ]
         ),
+        "notes": "\n".join(
+            [
+                "Заметки:",
+                "- сделай заметку клиент Иван предпочитает звонки после 14:00",
+                "- найди заметку про Ивана",
+                "- что я записывал про документы",
+                "- /notes — последние заметки",
+                "- /notes Иван — поиск по заметкам",
+                "Заметки хранятся локально в data/notes.jsonl и шифруются.",
+            ]
+        ),
         "memory": "\n".join(
             [
                 "Память и контроль:",
@@ -1311,6 +1465,9 @@ def capabilities_keyboard() -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton("Голос", callback_data="help:voice"),
                 InlineKeyboardButton("Память", callback_data="help:memory"),
+            ],
+            [
+                InlineKeyboardButton("Заметки", callback_data="help:notes"),
             ],
         ]
     )
@@ -2424,6 +2581,53 @@ async def transcribe_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return await transcribe_file(ogg_path)
 
 
+async def maybe_handle_notes(
+    text: str,
+    *,
+    chat_id: int,
+    user_id: int | None,
+    reply_target: Any,
+    debug_id: int | None,
+) -> bool:
+    note_text = infer_note_create(text)
+    if note_text is not None:
+        if not note_text:
+            reply = "Что записать в заметку? Скажи: сделай заметку <текст>."
+            store.update_debug_log(debug_id, intent_kind="note_create", result="missing_text")
+            await safe_reply_text(reply_target, reply)
+            store.add_memory_message(chat_id=chat_id, user_id=None, role="assistant", text=reply)
+            return True
+
+        note = add_note(chat_id, user_id, note_text)
+        reply = format_note_created(note)
+        store.update_debug_log(
+            debug_id,
+            intent_kind="note_create",
+            intent_payload={"text": note_text},
+            result="created",
+        )
+        store.add_action_history(chat_id, "note_create", reply, {"note_id": note["id"]})
+        await safe_reply_text(reply_target, reply)
+        store.add_memory_message(chat_id=chat_id, user_id=None, role="assistant", text=reply)
+        return True
+
+    note_query = infer_note_query(text)
+    if note_query:
+        notes = search_notes(chat_id, note_query, user_id=user_id)
+        reply = format_note_results(note_query, notes)
+        store.update_debug_log(
+            debug_id,
+            intent_kind="note_search",
+            intent_payload={"query": note_query, "count": len(notes)},
+            result="replied",
+        )
+        await safe_reply_text(reply_target, reply)
+        store.add_memory_message(chat_id=chat_id, user_id=None, role="assistant", text=reply)
+        return True
+
+    return False
+
+
 async def handle_text(
     text: str,
     update: Update,
@@ -2462,6 +2666,15 @@ async def handle_text(
             role="assistant",
             text=reply,
         )
+        return
+
+    if await maybe_handle_notes(
+        text,
+        chat_id=update.effective_chat.id,
+        user_id=update.effective_user.id,
+        reply_target=update.message,
+        debug_id=debug_id,
+    ):
         return
 
     reminder_range = reminder_range_from_text(text)
@@ -2684,6 +2897,15 @@ async def process_external_text(
         store.update_debug_log(debug_id, intent_kind="capabilities", result="replied")
         await safe_reply_text(reply_target, reply, reply_markup=capabilities_keyboard())
         store.add_memory_message(chat_id=chat_id, user_id=None, role="assistant", text=reply)
+        return
+
+    if await maybe_handle_notes(
+        text,
+        chat_id=chat_id,
+        user_id=user_id,
+        reply_target=reply_target,
+        debug_id=debug_id,
+    ):
         return
 
     reminder_range = reminder_range_from_text(text)
@@ -3114,6 +3336,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "voice": "voice",
         "голос": "voice",
         "memory": "memory",
+        "notes": "notes",
+        "заметки": "notes",
+        "заметка": "notes",
         "память": "memory",
     }
     await update.message.reply_text(
@@ -3134,6 +3359,31 @@ async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             ]
         )
     )
+
+
+async def notes_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+    if not is_allowed(update):
+        await update.message.reply_text("Доступ к этому боту ограничен.")
+        return
+
+    user_id = update.effective_user.id if update.effective_user else None
+    query = " ".join(context.args).strip()
+    if query:
+        notes = search_notes(update.effective_chat.id, query, user_id=user_id)
+        await safe_reply_text(update.message, format_note_results(query, notes))
+        return
+
+    notes = list(reversed(iter_notes(update.effective_chat.id, user_id=user_id)))[:10]
+    if not notes:
+        await safe_reply_text(update.message, "Заметок пока нет. Скажи: сделай заметку <текст>.")
+        return
+
+    lines = ["Последние заметки:"]
+    for index, note in enumerate(notes, start=1):
+        lines.append(f"{index}. {format_msk_dt(note['created_at'])} — {note['text']}")
+    await safe_reply_text(update.message, "\n".join(lines))
 
 
 async def memory_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3934,6 +4184,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("whoami", whoami))
+    app.add_handler(CommandHandler("notes", notes_command))
     app.add_handler(CommandHandler("memory", memory_status))
     app.add_handler(CommandHandler("forget_today", forget_today))
     app.add_handler(CommandHandler("today", today))
@@ -3947,7 +4198,7 @@ def main() -> None:
     app.add_handler(CommandHandler("debuglog", debug_log))
     app.add_handler(CommandHandler("privacy", privacy_status))
     app.add_handler(CommandHandler("stt", stt_status))
-    app.add_handler(CallbackQueryHandler(handle_help_callback, pattern=r"^help:(calendar|reminders|voice|memory)$"))
+    app.add_handler(CallbackQueryHandler(handle_help_callback, pattern=r"^help:(calendar|reminders|voice|memory|notes)$"))
     app.add_handler(CallbackQueryHandler(handle_event_selection, pattern=r"^event_select:\d+$"))
     app.add_handler(CallbackQueryHandler(handle_reminder_selection, pattern=r"^reminder_select:\d+$"))
     app.add_handler(CallbackQueryHandler(handle_reminder_delete_scope, pattern=r"^reminder_delete_scope:(today|tomorrow|date|all)$"))
