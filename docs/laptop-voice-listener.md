@@ -66,3 +66,24 @@ diagnostic command or by the listener startup output.
 
 Raise `WAKE_ENERGY_THRESHOLD` if it triggers on noise. Lower it if it misses
 your voice.
+
+Diagnostics:
+
+```powershell
+.\.venv\Scripts\python.exe voice_listener.py --list-devices
+.\.venv\Scripts\python.exe voice_listener.py --meter 10
+.\.venv\Scripts\python.exe voice_listener.py --record-test 5
+.\.venv\Scripts\python.exe voice_listener.py --send-test "что ты умеешь"
+```
+
+`--meter` shows whether the microphone crosses `WAKE_ENERGY_THRESHOLD`.
+`--record-test` saves a WAV file to `data/voice_debug` and prints the local
+Whisper transcription. If the WAV is silent, the selected input device is wrong.
+If the transcription is wrong, tune the microphone or local Whisper model.
+
+To keep recordings for later inspection while running normally:
+
+```env
+WAKE_SAVE_RECORDINGS=true
+WAKE_DEBUG_DIR=data/voice_debug
+```
