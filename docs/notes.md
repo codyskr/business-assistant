@@ -24,6 +24,21 @@ Find a note:
 /notes Иван
 ```
 
+Search uses two layers:
+
+```text
+1. local lexical/fuzzy search with a few synonym expansions
+2. optional local Ollama reranking for semantic relevance
+```
+
+The model is local through `OLLAMA_URL`; notes are not sent to external APIs by
+this feature.
+
+```env
+NOTES_LLM_SEARCH_ENABLED=true
+NOTES_LLM_SEARCH_LIMIT=30
+```
+
 Show recent notes:
 
 ```text

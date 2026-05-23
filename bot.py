@@ -47,6 +47,13 @@ ALLOWED_TELEGRAM_USER_IDS = {
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
+NOTES_LLM_SEARCH_ENABLED = os.getenv("NOTES_LLM_SEARCH_ENABLED", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+NOTES_LLM_SEARCH_LIMIT = int(os.getenv("NOTES_LLM_SEARCH_LIMIT", "30"))
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
 PRIVACY_MODE = os.getenv("PRIVACY_MODE", "balanced").strip().lower()
 STT_PROVIDER = os.getenv("STT_PROVIDER", "local").strip().lower()
@@ -676,6 +683,28 @@ def note_score(query: str, note_text: str) -> int:
     return int(len(query_words & text_words) / len(query_words) * 100)
 
 
+def expand_note_query(query: str) -> str:
+    normalized = normalize_search_text(query)
+    aliases = {
+        "звон": "звонок созвон позвонить",
+        "созвон": "звонок звонить встреча",
+        "встреч": "созвон звонок мероприятие",
+        "клиент": "заказчик контакт человек",
+        "документ": "файл договор отчет pdf скан",
+        "отчет": "документ файл сводка",
+        "деньг": "оплата платеж счет сумма",
+        "оплат": "деньги платеж счет сумма",
+        "машин": "авто автомобиль",
+        "авто": "машина автомобиль",
+    }
+    extra = []
+    for word in normalized.split():
+        for key, value in aliases.items():
+            if word.startswith(key) or key.startswith(word):
+                extra.append(value)
+    return " ".join([query, *extra]).strip()
+
+
 def add_note(chat_id: int, user_id: int | None, text: str) -> dict[str, Any]:
     NOTES_PATH.parent.mkdir(parents=True, exist_ok=True)
     note = {
@@ -722,13 +751,111 @@ def iter_notes(chat_id: int, user_id: int | None = None) -> list[dict[str, Any]]
 
 
 def search_notes(chat_id: int, query: str, user_id: int | None = None, limit: int = 5) -> list[dict[str, Any]]:
+    expanded_query = expand_note_query(query)
     ranked = []
     for note in iter_notes(chat_id, user_id):
-        score = note_score(query, str(note.get("text", "")))
-        if score >= 35:
+        score = note_score(expanded_query, str(note.get("text", "")))
+        if score >= 25:
             ranked.append((score, note))
     ranked.sort(key=lambda item: (item[0], item[1].get("created_at", "")), reverse=True)
     return [note | {"score": score} for score, note in ranked[:limit]]
+
+
+async def rerank_notes_with_ollama(query: str, notes: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    if not NOTES_LLM_SEARCH_ENABLED or not notes:
+        return notes[:limit]
+
+    numbered = []
+    for index, note in enumerate(notes, start=1):
+        numbered.append(
+            {
+                "index": index,
+                "created_at": note.get("created_at"),
+                "text": str(note.get("text", ""))[:900],
+            }
+        )
+
+    system_prompt = """
+You rerank encrypted local notes after they have been decrypted locally.
+Return JSON only. Choose notes that are relevant to the user's query by meaning,
+including synonyms and paraphrases. Do not invent notes.
+Format:
+{
+  "matches": [
+    {"index": 1, "score": 95},
+    {"index": 3, "score": 70}
+  ]
+}
+Use score 0-100. Return at most 5 matches.
+"""
+    payload = {
+        "model": OLLAMA_MODEL,
+        "format": "json",
+        "stream": False,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {"query": query, "notes": numbered},
+                    ensure_ascii=False,
+                ),
+            },
+        ],
+        "options": {"temperature": 0.0, "num_ctx": 4096},
+    }
+
+    async with httpx.AsyncClient(timeout=45) as client:
+        response = await client.post(f"{OLLAMA_URL}/api/chat", json=payload)
+        response.raise_for_status()
+        content = response.json()["message"]["content"]
+
+    data = json.loads(content)
+    matches = data.get("matches", [])
+    ranked = []
+    for match in matches:
+        try:
+            index = int(match.get("index")) - 1
+            score = int(match.get("score", 0))
+        except Exception:
+            continue
+        if 0 <= index < len(notes) and score >= 45:
+            note = dict(notes[index])
+            note["score"] = max(int(note.get("score", 0)), score)
+            ranked.append(note)
+
+    if not ranked:
+        return notes[:limit]
+    ranked.sort(key=lambda note: (int(note.get("score", 0)), note.get("created_at", "")), reverse=True)
+    return ranked[:limit]
+
+
+async def search_notes_contextual(
+    chat_id: int,
+    query: str,
+    user_id: int | None = None,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    lexical = search_notes(chat_id, query, user_id=user_id, limit=NOTES_LLM_SEARCH_LIMIT)
+    all_notes = list(reversed(iter_notes(chat_id, user_id=user_id)))[:NOTES_LLM_SEARCH_LIMIT]
+
+    seen = set()
+    candidates = []
+    for note in [*lexical, *all_notes]:
+        note_id = note.get("id")
+        if note_id in seen:
+            continue
+        seen.add(note_id)
+        candidates.append(note)
+
+    if not candidates:
+        return []
+
+    try:
+        return await rerank_notes_with_ollama(query, candidates, limit)
+    except Exception:
+        logger.warning("Ollama note rerank failed; using lexical search", exc_info=True)
+        return lexical[:limit] if lexical else candidates[:limit]
 
 
 def infer_note_create(text: str) -> str | None:
@@ -2606,7 +2733,7 @@ async def maybe_handle_notes(
 
     note_query = infer_note_query(text)
     if note_query:
-        notes = search_notes(chat_id, note_query, user_id=user_id)
+        notes = await search_notes_contextual(chat_id, note_query, user_id=user_id)
         reply = format_note_results(note_query, notes)
         store.update_debug_log(
             debug_id,
@@ -3202,7 +3329,7 @@ async def notes_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     user_id = update.effective_user.id if update.effective_user else None
     query = " ".join(context.args).strip()
     if query:
-        notes = search_notes(update.effective_chat.id, query, user_id=user_id)
+        notes = await search_notes_contextual(update.effective_chat.id, query, user_id=user_id)
         await safe_reply_text(update.message, format_note_results(query, notes))
         return
 
