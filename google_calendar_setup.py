@@ -13,17 +13,26 @@ from googleapiclient.discovery import build
 
 
 BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+GOOGLE_TOKENS_DIR = DATA_DIR / "google_tokens"
 CREDENTIALS_PATH = BASE_DIR / "credentials.json"
 TOKEN_PATH = BASE_DIR / "token.json"
 SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
 
 
-def get_service():
+def token_path_for_user(user_id: int | None) -> Path:
+    if user_id is None:
+        return TOKEN_PATH
+    return GOOGLE_TOKENS_DIR / f"{user_id}.json"
+
+
+def get_service(user_id: int | None = None):
     load_dotenv()
     creds = None
+    token_path = token_path_for_user(user_id)
 
-    if TOKEN_PATH.exists():
-        creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
+    if token_path.exists():
+        creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
@@ -31,7 +40,7 @@ def get_service():
                 creds.refresh(Request())
             except RefreshError:
                 print("Saved Google token is expired or revoked. Re-authorizing...")
-                TOKEN_PATH.unlink(missing_ok=True)
+                token_path.unlink(missing_ok=True)
                 creds = None
 
         if not creds or not creds.valid:
@@ -47,7 +56,8 @@ def get_service():
             )
             creds = flow.run_local_server(port=0)
 
-        TOKEN_PATH.write_text(creds.to_json(), encoding="utf-8")
+        token_path.parent.mkdir(parents=True, exist_ok=True)
+        token_path.write_text(creds.to_json(), encoding="utf-8")
 
     return build("calendar", "v3", credentials=creds)
 
@@ -79,10 +89,17 @@ def main():
         action="store_true",
         help="Create a short test event 10 minutes from now.",
     )
+    parser.add_argument(
+        "--user-id",
+        type=int,
+        default=None,
+        help="Telegram user id. Saves OAuth token to data/google_tokens/<user-id>.json.",
+    )
     args = parser.parse_args()
 
-    service = get_service()
-    print(f"Google Calendar OAuth is ready. Token saved to {TOKEN_PATH}")
+    service = get_service(args.user_id)
+    token_path = token_path_for_user(args.user_id)
+    print(f"Google Calendar OAuth is ready. Token saved to {token_path}")
 
     if args.create_test:
         create_test_event(service)

@@ -34,6 +34,7 @@ DB_PATH = DATA_DIR / "agent.db"
 REMINDERS_MD_PATH = DATA_DIR / "reminders.md"
 CREDENTIALS_PATH = BASE_DIR / "credentials.json"
 TOKEN_PATH = BASE_DIR / "token.json"
+GOOGLE_TOKENS_DIR = DATA_DIR / "google_tokens"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ALLOWED_TELEGRAM_USER_IDS = {
@@ -198,6 +199,16 @@ class Store:
                     result TEXT,
                     error TEXT,
                     created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_settings (
+                    user_id INTEGER PRIMARY KEY,
+                    google_calendar_id TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
                 )
                 """
             )
@@ -587,6 +598,30 @@ class Store:
             if row:
                 conn.execute("DELETE FROM reminder_selections WHERE id = ?", (selection_id,))
             return row
+
+    def get_user_calendar_id(self, user_id: int) -> str:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT google_calendar_id FROM user_settings WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            if row and row["google_calendar_id"]:
+                return str(row["google_calendar_id"])
+        return GOOGLE_CALENDAR_ID
+
+    def set_user_calendar_id(self, user_id: int, calendar_id: str) -> None:
+        now = now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO user_settings (user_id, google_calendar_id, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    google_calendar_id = excluded.google_calendar_id,
+                    updated_at = excluded.updated_at
+                """,
+                (user_id, calendar_id, now, now),
+            )
 
 
 def get_fernet() -> Fernet:
@@ -1713,27 +1748,40 @@ async def safe_reply_text(message: Any, text: str, **kwargs: Any) -> bool:
     return False
 
 
-def get_calendar_service() -> Any:
+def google_token_path_for_user(user_id: int | None) -> Path:
+    if user_id is None:
+        return TOKEN_PATH
+    return GOOGLE_TOKENS_DIR / f"{user_id}.json"
+
+
+def get_calendar_service(user_id: int | None = None) -> Any:
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
     from google.auth.exceptions import RefreshError
     from google_auth_oauthlib.flow import InstalledAppFlow
     from googleapiclient.discovery import build
 
+    token_path = google_token_path_for_user(user_id)
     creds = None
-    if TOKEN_PATH.exists():
-        creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), GOOGLE_SCOPES)
+    if token_path.exists():
+        creds = Credentials.from_authorized_user_file(str(token_path), GOOGLE_SCOPES)
+    elif user_id is not None and TOKEN_PATH.exists():
+        # Backward-compatible migration for the first configured user.
+        token_path.parent.mkdir(parents=True, exist_ok=True)
+        token_path.write_text(TOKEN_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+        creds = Credentials.from_authorized_user_file(str(token_path), GOOGLE_SCOPES)
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             try:
                 creds.refresh(Request())
             except RefreshError:
-                if TOKEN_PATH.exists():
-                    TOKEN_PATH.unlink()
+                if token_path.exists():
+                    token_path.unlink()
                 creds = None
                 raise RuntimeError(
-                    "Google Calendar token expired or was revoked. Run `python google_calendar_setup.py` to authorize again."
+                    f"Google Calendar token expired or was revoked for user {user_id}. "
+                    f"Run `python google_calendar_setup.py --user-id {user_id}` to authorize again."
                 )
         else:
             if not CREDENTIALS_PATH.exists():
@@ -1746,7 +1794,8 @@ def get_calendar_service() -> Any:
             )
             creds = flow.run_local_server(port=0)
 
-        TOKEN_PATH.write_text(creds.to_json(), encoding="utf-8")
+        token_path.parent.mkdir(parents=True, exist_ok=True)
+        token_path.write_text(creds.to_json(), encoding="utf-8")
 
     return build("calendar", "v3", credentials=creds)
 
@@ -1769,7 +1818,7 @@ async def google_api_to_thread(fn: Any, *, attempts: int = 3) -> Any:
     raise last_exc
 
 
-async def create_calendar_event(action: dict[str, Any]) -> str:
+async def create_calendar_event(action: dict[str, Any], user_id: int | None = None) -> str:
     event = action["event"]
     start = parse_dt(event["start"])
     end_raw = event.get("end")
@@ -1795,10 +1844,11 @@ async def create_calendar_event(action: dict[str, Any]) -> str:
         ],
     }
 
-    service = await asyncio.to_thread(get_calendar_service)
+    service = await asyncio.to_thread(get_calendar_service, user_id)
+    calendar_id = store.get_user_calendar_id(user_id) if user_id is not None else GOOGLE_CALENDAR_ID
     created = await google_api_to_thread(
         lambda: service.events()
-        .insert(calendarId=GOOGLE_CALENDAR_ID, body=body)
+        .insert(calendarId=calendar_id, body=body)
         .execute()
     )
     return created.get("htmlLink", "Событие создано.")
@@ -1811,6 +1861,7 @@ async def create_calendar_event_from_fields(
     description: str = "",
     location: str | None = None,
     reminder_minutes: int | None = None,
+    user_id: int | None = None,
 ) -> str:
     action = {
         "event": {
@@ -1826,7 +1877,7 @@ async def create_calendar_event_from_fields(
             ),
         }
     }
-    return await create_calendar_event(action)
+    return await create_calendar_event(action, user_id=user_id)
 
 
 def calendar_event_summary(action: dict[str, Any], link: str | None = None) -> str:
@@ -1855,11 +1906,15 @@ def calendar_event_summary(action: dict[str, Any], link: str | None = None) -> s
     return "\n".join(lines)
 
 
-async def find_calendar_events(action: dict[str, Any]) -> list[dict[str, Any]]:
-    return await find_calendar_events_limited(action, limit=10)
+async def find_calendar_events(action: dict[str, Any], user_id: int | None = None) -> list[dict[str, Any]]:
+    return await find_calendar_events_limited(action, limit=10, user_id=user_id)
 
 
-async def find_calendar_events_limited(action: dict[str, Any], limit: int) -> list[dict[str, Any]]:
+async def find_calendar_events_limited(
+    action: dict[str, Any],
+    limit: int,
+    user_id: int | None = None,
+) -> list[dict[str, Any]]:
     query = action["delete_event"]
     zone = ZoneInfo(TIMEZONE)
     now = datetime.now(zone)
@@ -1870,22 +1925,28 @@ async def find_calendar_events_limited(action: dict[str, Any], limit: int) -> li
         else now + timedelta(days=30)
     )
 
-    events = await list_calendar_events(time_min, time_max, max_results=50)
+    events = await list_calendar_events(time_min, time_max, max_results=50, user_id=user_id)
     ranked = rank_calendar_events(events, query.get("query"))
     if not ranked and (query.get("time_min") or query.get("time_max")):
-        events = await list_calendar_events(now, now + timedelta(days=30), max_results=100)
+        events = await list_calendar_events(now, now + timedelta(days=30), max_results=100, user_id=user_id)
         ranked = rank_calendar_events(events, query.get("query"))
     return ranked[:limit]
 
 
-async def list_calendar_events(time_min: datetime, time_max: datetime, max_results: int = 20) -> list[dict[str, Any]]:
-    service = await asyncio.to_thread(get_calendar_service)
+async def list_calendar_events(
+    time_min: datetime,
+    time_max: datetime,
+    max_results: int = 20,
+    user_id: int | None = None,
+) -> list[dict[str, Any]]:
+    service = await asyncio.to_thread(get_calendar_service, user_id)
+    calendar_id = store.get_user_calendar_id(user_id) if user_id is not None else GOOGLE_CALENDAR_ID
 
     def request() -> dict[str, Any]:
         return (
             service.events()
             .list(
-                calendarId=GOOGLE_CALENDAR_ID,
+                calendarId=calendar_id,
                 timeMin=time_min.isoformat(),
                 timeMax=time_max.isoformat(),
                 singleEvents=True,
@@ -1899,29 +1960,36 @@ async def list_calendar_events(time_min: datetime, time_max: datetime, max_resul
     return list(result.get("items", []))
 
 
-async def delete_calendar_event_by_id(event_id: str) -> None:
-    service = await asyncio.to_thread(get_calendar_service)
+async def delete_calendar_event_by_id(event_id: str, user_id: int | None = None) -> None:
+    service = await asyncio.to_thread(get_calendar_service, user_id)
+    calendar_id = store.get_user_calendar_id(user_id) if user_id is not None else GOOGLE_CALENDAR_ID
     await google_api_to_thread(
         lambda: service.events()
-        .delete(calendarId=GOOGLE_CALENDAR_ID, eventId=event_id)
+        .delete(calendarId=calendar_id, eventId=event_id)
         .execute()
     )
 
 
-async def update_calendar_event_time(event_id: str, start: datetime, end: datetime) -> dict[str, Any]:
-    service = await asyncio.to_thread(get_calendar_service)
+async def update_calendar_event_time(
+    event_id: str,
+    start: datetime,
+    end: datetime,
+    user_id: int | None = None,
+) -> dict[str, Any]:
+    service = await asyncio.to_thread(get_calendar_service, user_id)
+    calendar_id = store.get_user_calendar_id(user_id) if user_id is not None else GOOGLE_CALENDAR_ID
 
     def request() -> dict[str, Any]:
         event = (
             service.events()
-            .get(calendarId=GOOGLE_CALENDAR_ID, eventId=event_id)
+            .get(calendarId=calendar_id, eventId=event_id)
             .execute()
         )
         event["start"] = {"dateTime": start.isoformat(), "timeZone": TIMEZONE}
         event["end"] = {"dateTime": end.isoformat(), "timeZone": TIMEZONE}
         return (
             service.events()
-            .update(calendarId=GOOGLE_CALENDAR_ID, eventId=event_id, body=event)
+            .update(calendarId=calendar_id, eventId=event_id, body=event)
             .execute()
         )
 
@@ -2406,7 +2474,7 @@ async def handle_text(
     if calendar_range:
         title, start, end = calendar_range
         try:
-            events = await list_calendar_events(start, end)
+            events = await list_calendar_events(start, end, user_id=update.effective_user.id)
             reply = format_calendar_events(events, title)
             store.update_debug_log(debug_id, intent_kind="calendar_list", result="replied")
         except Exception as exc:
@@ -2454,6 +2522,7 @@ async def handle_text(
             await execute_action(
                 intent.data,
                 chat_id=update.effective_chat.id,
+                user_id=update.effective_user.id,
                 app=context.application,
                 reply_target=update.message,
             )
@@ -2520,6 +2589,7 @@ async def handle_text(
             await execute_action(
                 intent.data,
                 chat_id=update.effective_chat.id,
+                user_id=update.effective_user.id,
                 app=context.application,
                 reply_target=update.message,
             )
@@ -2565,12 +2635,13 @@ async def handle_text(
 async def execute_action(
     parsed: dict[str, Any],
     chat_id: int,
+    user_id: int | None,
     app: Application,
     reply_target: Any,
 ) -> None:
     try:
         if parsed["kind"] == "calendar_event":
-            link = await create_calendar_event(parsed)
+            link = await create_calendar_event(parsed, user_id=user_id)
             await safe_reply_text(reply_target, calendar_event_summary(parsed, link))
         elif parsed["kind"] == "reminder":
             reminder = parsed["reminder"]
@@ -2636,6 +2707,7 @@ async def execute_action(
                     end=occurrence["end"],
                     description=recurring.get("description", ""),
                     reminder_minutes=recurring.get("reminder_minutes"),
+                    user_id=user_id,
                 )
                 links.append(link)
             await safe_reply_text(
@@ -2652,21 +2724,21 @@ async def execute_action(
             )
         elif parsed["kind"] == "delete_calendar_event":
             if parsed["delete_event"].get("delete_all"):
-                events = await find_calendar_events_limited(parsed, limit=100)
+                events = await find_calendar_events_limited(parsed, limit=100, user_id=user_id)
                 if not events:
                     await safe_reply_text(reply_target, "Не нашел подходящих событий в календаре.")
                 else:
                     for event in events:
-                        await delete_calendar_event_by_id(event["id"])
+                        await delete_calendar_event_by_id(event["id"], user_id=user_id)
                     await safe_reply_text(reply_target, f"Удалено событий: {len(events)}")
                 return
 
-            events = await find_calendar_events(parsed)
+            events = await find_calendar_events(parsed, user_id=user_id)
             if not events:
                 await safe_reply_text(reply_target, "Не нашел подходящих событий в календаре.")
             elif len(events) == 1:
                 event = events[0]
-                await delete_calendar_event_by_id(event["id"])
+                await delete_calendar_event_by_id(event["id"], user_id=user_id)
                 await safe_reply_text(reply_target, f"Событие удалено: {calendar_event_label(event)}")
             else:
                 await ask_user_to_select_event(
@@ -2679,11 +2751,11 @@ async def execute_action(
                 )
         elif parsed["kind"] == "reschedule_calendar_event":
             delete_shape = {"delete_event": parsed["reschedule_event"]}
-            events = await find_calendar_events(delete_shape)
+            events = await find_calendar_events(delete_shape, user_id=user_id)
             if not events:
                 await safe_reply_text(reply_target, "Не нашел подходящих событий в календаре.")
             elif len(events) == 1:
-                updated = await reschedule_calendar_event_by_payload(events[0], parsed)
+                updated = await reschedule_calendar_event_by_payload(events[0], parsed, user_id=user_id)
                 await safe_reply_text(reply_target, f"Событие перенесено: {calendar_event_label(updated)}")
             else:
                 await ask_user_to_select_event(
@@ -2831,6 +2903,7 @@ async def execute_delete_reminders(
 async def reschedule_calendar_event_by_payload(
     event: dict[str, Any],
     payload: dict[str, Any],
+    user_id: int | None = None,
 ) -> dict[str, Any]:
     reschedule = payload["reschedule_event"]
     new_start = parse_dt(reschedule["new_start"])
@@ -2845,7 +2918,7 @@ async def reschedule_calendar_event_by_payload(
             duration = timedelta(hours=1)
         new_end = new_start + duration
 
-    return await update_calendar_event_time(event["id"], new_start, new_end)
+    return await update_calendar_event_time(event["id"], new_start, new_end, user_id=user_id)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2944,7 +3017,8 @@ async def show_calendar_range(
         return
 
     try:
-        events = await list_calendar_events(start, end)
+        user_id = update.effective_user.id if update.effective_user else None
+        events = await list_calendar_events(start, end, user_id=user_id)
     except Exception as exc:
         logger.exception("Calendar listing failed")
         await update.message.reply_text(f"Не получилось прочитать календарь: {exc}")
@@ -3109,23 +3183,52 @@ async def calendar_auth_status(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     try:
-        await asyncio.to_thread(get_calendar_service)
+        user_id = update.effective_user.id if update.effective_user else None
+        await asyncio.to_thread(get_calendar_service, user_id)
+        calendar_id = store.get_user_calendar_id(user_id) if user_id is not None else GOOGLE_CALENDAR_ID
     except Exception as exc:
         await safe_reply_text(
             update.message,
             "\n".join(
                 [
-                    "Google Calendar сейчас не авторизован.",
+                    "Google Calendar сейчас не авторизован для вашего Telegram user id.",
                     f"Причина: {exc}",
                     "Запусти в терминале:",
-                    "python google_calendar_setup.py",
+                    f"python google_calendar_setup.py --user-id {update.effective_user.id if update.effective_user else '<id>'}",
                     "Потом перезапусти бота.",
                 ]
             ),
         )
         return
 
-    await safe_reply_text(update.message, "Google Calendar авторизация работает.")
+    await safe_reply_text(update.message, f"Google Calendar авторизация работает.\nCalendar ID: {calendar_id}")
+
+
+async def calendar_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+    if not is_allowed(update):
+        await update.message.reply_text("Доступ к этому боту ограничен.")
+        return
+
+    if not context.args:
+        await safe_reply_text(
+            update.message,
+            "\n".join(
+                [
+                    f"Текущий Calendar ID: {store.get_user_calendar_id(update.effective_user.id)}",
+                    "Чтобы изменить:",
+                    "/calendar_set primary",
+                    "или",
+                    "/calendar_set your_calendar_id@group.calendar.google.com",
+                ]
+            ),
+        )
+        return
+
+    calendar_id = " ".join(context.args).strip()
+    store.set_user_calendar_id(update.effective_user.id, calendar_id)
+    await safe_reply_text(update.message, f"Calendar ID сохранен для вас: {calendar_id}")
 
 
 def short_debug_text(value: str, limit: int = 180) -> str:
@@ -3258,10 +3361,11 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     parsed = json.loads(row["action_json"])
+    user_id = int(row["user_id"]) if row["user_id"] is not None else None
 
     try:
         if parsed["kind"] == "calendar_event":
-            link = await create_calendar_event(parsed)
+            link = await create_calendar_event(parsed, user_id=user_id)
             await query.edit_message_text(calendar_event_summary(parsed, link))
         elif parsed["kind"] == "reminder":
             reminder = parsed["reminder"]
@@ -3324,6 +3428,7 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
                     end=occurrence["end"],
                     description=recurring.get("description", ""),
                     reminder_minutes=recurring.get("reminder_minutes"),
+                    user_id=user_id,
                 )
             await query.edit_message_text(
                 "\n".join(
@@ -3338,21 +3443,21 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
         elif parsed["kind"] == "delete_calendar_event":
             if parsed["delete_event"].get("delete_all"):
-                events = await find_calendar_events_limited(parsed, limit=100)
+                events = await find_calendar_events_limited(parsed, limit=100, user_id=user_id)
                 if not events:
                     await query.edit_message_text("Не нашел подходящих событий в календаре.")
                 else:
                     for event in events:
-                        await delete_calendar_event_by_id(event["id"])
+                        await delete_calendar_event_by_id(event["id"], user_id=user_id)
                     await query.edit_message_text(f"Удалено событий: {len(events)}")
                 return
 
-            events = await find_calendar_events(parsed)
+            events = await find_calendar_events(parsed, user_id=user_id)
             if not events:
                 await query.edit_message_text("Не нашел подходящих событий в календаре.")
             elif len(events) == 1:
                 event = events[0]
-                await delete_calendar_event_by_id(event["id"])
+                await delete_calendar_event_by_id(event["id"], user_id=user_id)
                 await query.edit_message_text(f"Событие удалено: {calendar_event_label(event)}")
             else:
                 await query.edit_message_text("Нашел несколько событий. Выберите ниже.")
@@ -3366,11 +3471,11 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
                 )
         elif parsed["kind"] == "reschedule_calendar_event":
             delete_shape = {"delete_event": parsed["reschedule_event"]}
-            events = await find_calendar_events(delete_shape)
+            events = await find_calendar_events(delete_shape, user_id=user_id)
             if not events:
                 await query.edit_message_text("Не нашел подходящих событий в календаре.")
             elif len(events) == 1:
-                updated = await reschedule_calendar_event_by_payload(events[0], parsed)
+                updated = await reschedule_calendar_event_by_payload(events[0], parsed, user_id=user_id)
                 await query.edit_message_text(f"Событие перенесено: {calendar_event_label(updated)}")
             else:
                 await query.edit_message_text("Нашел несколько событий. Выберите ниже.")
@@ -3412,11 +3517,12 @@ async def handle_event_selection(update: Update, context: ContextTypes.DEFAULT_T
     action = row["action"]
 
     try:
+        user_id = update.effective_user.id if update.effective_user else None
         if action == "delete":
-            await delete_calendar_event_by_id(event["id"])
+            await delete_calendar_event_by_id(event["id"], user_id=user_id)
             await query.edit_message_text(f"Событие удалено: {calendar_event_label(event)}")
         elif action == "reschedule":
-            updated = await reschedule_calendar_event_by_payload(event, payload)
+            updated = await reschedule_calendar_event_by_payload(event, payload, user_id=user_id)
             await query.edit_message_text(f"Событие перенесено: {calendar_event_label(updated)}")
         else:
             await query.edit_message_text("Неизвестный выбор.")
@@ -3583,6 +3689,7 @@ def main() -> None:
     app.add_handler(CommandHandler("actions", actions))
     app.add_handler(CommandHandler("last", last_action))
     app.add_handler(CommandHandler("calendar_auth", calendar_auth_status))
+    app.add_handler(CommandHandler("calendar_set", calendar_set))
     app.add_handler(CommandHandler("debuglog", debug_log))
     app.add_handler(CommandHandler("privacy", privacy_status))
     app.add_handler(CommandHandler("stt", stt_status))
