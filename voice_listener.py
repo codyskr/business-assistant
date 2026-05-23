@@ -29,6 +29,7 @@ WAKE_WORDS = [
     if word.strip()
 ]
 WAKE_INPUT_DEVICE = os.getenv("WAKE_INPUT_DEVICE", "").strip()
+WAKE_TRANSCRIBE_PROVIDER = os.getenv("WAKE_TRANSCRIBE_PROVIDER", "local").strip().lower()
 LOCAL_COMMAND_URL = os.getenv("LOCAL_COMMAND_URL", "http://127.0.0.1:8765/command")
 LOCAL_COMMAND_TOKEN = os.getenv("LOCAL_COMMAND_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("WAKE_TELEGRAM_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID", "")
@@ -208,9 +209,57 @@ def meter(seconds: float) -> None:
 
 
 async def transcribe_wav(path: Path) -> str:
-    from bot import transcribe_with_local_whisper
+    from bot import (
+        GROQ_API_KEY,
+        GROQ_STT_MODEL,
+        GROQ_STT_URL,
+        OPENAI_API_KEY,
+        OPENAI_STT_MODEL,
+        OPENAI_STT_URL,
+        transcribe_with_local_whisper,
+        transcribe_with_openai_compatible,
+    )
 
-    return (await transcribe_with_local_whisper(path)).strip()
+    async def transcribe_with_provider(provider: str) -> str:
+        if provider == "local":
+            return (await transcribe_with_local_whisper(path)).strip()
+        if provider == "groq":
+            return (
+                await transcribe_with_openai_compatible(
+                    path,
+                    api_key=GROQ_API_KEY,
+                    url=GROQ_STT_URL,
+                    model=GROQ_STT_MODEL,
+                    provider_name="Groq",
+                )
+            ).strip()
+        if provider == "openai":
+            return (
+                await transcribe_with_openai_compatible(
+                    path,
+                    api_key=OPENAI_API_KEY,
+                    url=OPENAI_STT_URL,
+                    model=OPENAI_STT_MODEL,
+                    provider_name="OpenAI",
+                )
+            ).strip()
+        raise RuntimeError(f"Unknown WAKE_TRANSCRIBE_PROVIDER: {provider}")
+
+    if WAKE_TRANSCRIBE_PROVIDER == "local":
+        return (await transcribe_with_local_whisper(path)).strip()
+    if WAKE_TRANSCRIBE_PROVIDER == "groq":
+        return await transcribe_with_provider("groq")
+    if WAKE_TRANSCRIBE_PROVIDER == "openai":
+        return await transcribe_with_provider("openai")
+    if WAKE_TRANSCRIBE_PROVIDER == "auto":
+        errors = []
+        for provider in ("groq", "local"):
+            try:
+                return await transcribe_with_provider(provider)
+            except Exception as exc:
+                errors.append(f"{provider}: {exc}")
+        raise RuntimeError("; ".join(errors))
+    raise RuntimeError(f"Unknown WAKE_TRANSCRIBE_PROVIDER: {WAKE_TRANSCRIBE_PROVIDER}")
 
 
 def extract_command(text: str) -> str | None:
@@ -290,6 +339,7 @@ def listen_forever() -> None:
 
     print("Laptop voice listener started.")
     print(f"Wake words: {', '.join(WAKE_WORDS)}")
+    print(f"STT provider after voice trigger: {WAKE_TRANSCRIBE_PROVIDER}")
     print(f"Input device: {input_device}")
     print(f"Sample rate: {SAMPLE_RATE}, threshold: {ENERGY_THRESHOLD}")
     print("Speak the wake word and command in one phrase.")
@@ -351,6 +401,7 @@ if __name__ == "__main__":
     elif args.record_test:
         path = record_seconds(args.record_test)
         print("Transcribing...")
+        print(f"STT provider: {WAKE_TRANSCRIBE_PROVIDER}")
         text = asyncio.run(transcribe_wav(path))
         print(f"Recognized: {text or '<empty>'}")
         command = extract_command(text)

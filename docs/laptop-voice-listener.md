@@ -20,6 +20,7 @@ LOCAL_COMMAND_TOKEN=change_me
 LOCAL_COMMAND_URL=http://127.0.0.1:8765/command
 WAKE_WORDS=ассистент,помощник
 WAKE_INPUT_DEVICE=
+WAKE_TRANSCRIBE_PROVIDER=local
 WAKE_TELEGRAM_CHAT_ID=123456789
 WAKE_TELEGRAM_USER_ID=123456789
 ```
@@ -55,10 +56,16 @@ Tuning:
 
 ```env
 WAKE_INPUT_DEVICE=26
+WAKE_TRANSCRIBE_PROVIDER=groq
 WAKE_ENERGY_THRESHOLD=0.012
 WAKE_MAX_RECORD_SECONDS=12
 WAKE_SILENCE_SECONDS=1.0
 ```
+
+`WAKE_TRANSCRIBE_PROVIDER=local` keeps recognition fully local.
+`WAKE_TRANSCRIBE_PROVIDER=groq` sends only the recorded speech fragment after
+local voice activity detection. It does not stream the microphone continuously.
+`WAKE_TRANSCRIBE_PROVIDER=auto` tries Groq first and local Whisper if Groq fails.
 
 Leave `WAKE_INPUT_DEVICE` empty for auto-detection. If the listener cannot open
 the default microphone, set it to one of the input device indexes printed by the

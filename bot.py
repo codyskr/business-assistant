@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import mimetypes
 import os
 import sqlite3
 import tempfile
@@ -2334,7 +2335,8 @@ async def transcribe_with_openai_compatible(
 
     async with httpx.AsyncClient(timeout=90) as client:
         with ogg_path.open("rb") as audio_file:
-            files = {"file": ("voice.ogg", audio_file, "audio/ogg")}
+            content_type = mimetypes.guess_type(str(ogg_path))[0] or "application/octet-stream"
+            files = {"file": (ogg_path.name, audio_file, content_type)}
             response = await client.post(url, headers=headers, data=data, files=files)
             response.raise_for_status()
 
