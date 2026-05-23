@@ -60,6 +60,8 @@ WAKE_TRANSCRIBE_PROVIDER=groq
 WAKE_ENERGY_THRESHOLD=0.012
 WAKE_MAX_RECORD_SECONDS=12
 WAKE_SILENCE_SECONDS=1.0
+WAKE_COMMAND_DELAY_SECONDS=2.0
+WAKE_COMMAND_MAX_SECONDS=12
 ```
 
 `WAKE_TRANSCRIBE_PROVIDER=local` keeps recognition fully local.
@@ -94,3 +96,15 @@ To keep recordings for later inspection while running normally:
 WAKE_SAVE_RECORDINGS=true
 WAKE_DEBUG_DIR=data/voice_debug
 ```
+
+Two-step wake mode:
+
+```text
+джарвис
+...pause about two seconds...
+напомни завтра в 10 забрать документы
+```
+
+The first phrase is used only to detect the wake word. The command is recorded
+after `WAKE_COMMAND_DELAY_SECONDS`, so the command itself does not need to
+repeat the wake word.

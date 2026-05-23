@@ -23,6 +23,8 @@ ENERGY_THRESHOLD = float(os.getenv("WAKE_ENERGY_THRESHOLD", "0.012"))
 MIN_RECORD_SECONDS = float(os.getenv("WAKE_MIN_RECORD_SECONDS", "0.8"))
 MAX_RECORD_SECONDS = float(os.getenv("WAKE_MAX_RECORD_SECONDS", "12"))
 SILENCE_SECONDS = float(os.getenv("WAKE_SILENCE_SECONDS", "1.0"))
+WAKE_COMMAND_DELAY_SECONDS = float(os.getenv("WAKE_COMMAND_DELAY_SECONDS", "2.0"))
+WAKE_COMMAND_MAX_SECONDS = float(os.getenv("WAKE_COMMAND_MAX_SECONDS", str(MAX_RECORD_SECONDS)))
 WAKE_WORDS = [
     word.strip().lower()
     for word in os.getenv("WAKE_WORDS", "ассистент,помощник").split(",")
@@ -269,8 +271,13 @@ def extract_command(text: str) -> str | None:
         if index == -1:
             continue
         command = text[index + len(wake_word) :].strip(" ,.!?:;-—")
-        return command or text.strip()
+        return command
     return None
+
+
+def has_wake_word(text: str) -> bool:
+    lowered = text.lower().strip()
+    return any(wake_word in lowered for wake_word in WAKE_WORDS)
 
 
 def post_command(text: str) -> None:
@@ -298,28 +305,99 @@ def post_command(text: str) -> None:
         raise RuntimeError(f"Could not send command to bot: {exc}") from exc
 
 
-async def handle_recording(frames: list[bytes]) -> None:
+async def transcribe_frames(frames: list[bytes], prefix: str) -> str:
     save_recordings = os.getenv("WAKE_SAVE_RECORDINGS", "false").lower() == "true"
     if save_recordings:
         DEBUG_DIR.mkdir(parents=True, exist_ok=True)
-        wav_path = DEBUG_DIR / f"wake_command_{int(time.time())}.wav"
+        wav_path = DEBUG_DIR / f"{prefix}_{int(time.time())}.wav"
         write_wav(wav_path, frames)
         print(f"Saved recording: {wav_path.resolve()}")
-        text = await transcribe_wav(wav_path)
+        return await transcribe_wav(wav_path)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        wav_path = Path(temp_dir) / f"{prefix}.wav"
+        write_wav(wav_path, frames)
+        return await transcribe_wav(wav_path)
+
+
+def record_command_after_wake(np, sd, input_device) -> list[bytes]:
+    if WAKE_COMMAND_DELAY_SECONDS > 0:
+        print(f"Wake word detected. Waiting {WAKE_COMMAND_DELAY_SECONDS:.1f}s for command...")
+        time.sleep(WAKE_COMMAND_DELAY_SECONDS)
     else:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            wav_path = Path(temp_dir) / "wake_command.wav"
-            write_wav(wav_path, frames)
-            text = await transcribe_wav(wav_path)
+        print("Wake word detected. Listening for command...")
+
+    audio_queue: queue.Queue = queue.Queue()
+
+    def callback(indata, frames, time_info, status) -> None:
+        if status:
+            print(status)
+        audio_queue.put(indata.copy())
+
+    command_frames: list[bytes] = []
+    recording = False
+    started_at = time.monotonic()
+    voice_started_at = 0.0
+    last_voice_at = 0.0
+
+    with sd.InputStream(
+        device=input_device,
+        samplerate=SAMPLE_RATE,
+        channels=CHANNELS,
+        dtype="int16",
+        blocksize=CHUNK_SIZE,
+        callback=callback,
+    ):
+        while True:
+            chunk = audio_queue.get()
+            energy = rms(np, chunk / 32768.0)
+            now = time.monotonic()
+
+            if energy >= ENERGY_THRESHOLD:
+                if not recording:
+                    recording = True
+                    voice_started_at = now
+                    print(f"Command voice detected... energy={energy:.5f}")
+                last_voice_at = now
+
+            if recording:
+                command_frames.append(chunk.tobytes())
+                elapsed_voice = now - voice_started_at
+                silence = now - last_voice_at
+                if (
+                    elapsed_voice >= MIN_RECORD_SECONDS
+                    and silence >= SILENCE_SECONDS
+                ) or elapsed_voice >= WAKE_COMMAND_MAX_SECONDS:
+                    return command_frames
+
+            if not recording and now - started_at >= WAKE_COMMAND_MAX_SECONDS:
+                return command_frames
+
+
+async def handle_recording(frames: list[bytes], np, sd, input_device) -> None:
+    text = await transcribe_frames(frames, "wake_phrase")
 
     if not text:
         return
 
-    print(f"Recognized: {text}")
+    print(f"Wake phrase recognized: {text}")
     command = extract_command(text)
-    if not command:
+    if command is None:
         print(f"Ignored: wake word not found. Wake words: {', '.join(WAKE_WORDS)}")
         return
+
+    if not command:
+        command_frames = record_command_after_wake(np, sd, input_device)
+        if not command_frames:
+            print("No command speech detected after wake word.")
+            return
+        command = (await transcribe_frames(command_frames, "wake_command")).strip()
+        if not command:
+            print("Command transcription is empty.")
+            return
+        if has_wake_word(command):
+            command = extract_command(command) or command
+        print(f"Command recognized: {command}")
 
     print(f"Command: {command}")
     post_command(command)
@@ -342,7 +420,7 @@ def listen_forever() -> None:
     print(f"STT provider after voice trigger: {WAKE_TRANSCRIBE_PROVIDER}")
     print(f"Input device: {input_device}")
     print(f"Sample rate: {SAMPLE_RATE}, threshold: {ENERGY_THRESHOLD}")
-    print("Speak the wake word and command in one phrase.")
+    print("Say the wake word, pause, then say the command.")
 
     recording = False
     frames: list[bytes] = []
@@ -380,7 +458,7 @@ def listen_forever() -> None:
                 ) or elapsed >= MAX_RECORD_SECONDS:
                     recording = False
                     try:
-                        asyncio.run(handle_recording(frames))
+                        asyncio.run(handle_recording(frames, np, sd, input_device))
                     except Exception as exc:
                         print(f"Recording handling failed: {exc}")
                     frames = []
