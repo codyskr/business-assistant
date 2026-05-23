@@ -34,6 +34,7 @@ DATA_DIR = BASE_DIR / "data"
 DB_PATH = DATA_DIR / "agent.db"
 REMINDERS_MD_PATH = DATA_DIR / "reminders.md"
 NOTES_PATH = DATA_DIR / "notes.jsonl"
+KNOWLEDGE_PATH = DATA_DIR / "knowledge.jsonl"
 CREDENTIALS_PATH = BASE_DIR / "credentials.json"
 TOKEN_PATH = BASE_DIR / "token.json"
 GOOGLE_TOKENS_DIR = DATA_DIR / "google_tokens"
@@ -54,6 +55,16 @@ NOTES_LLM_SEARCH_ENABLED = os.getenv("NOTES_LLM_SEARCH_ENABLED", "true").lower()
     "on",
 }
 NOTES_LLM_SEARCH_LIMIT = int(os.getenv("NOTES_LLM_SEARCH_LIMIT", "30"))
+KNOWLEDGE_LLM_SEARCH_ENABLED = os.getenv("KNOWLEDGE_LLM_SEARCH_ENABLED", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+KNOWLEDGE_LLM_SEARCH_LIMIT = int(os.getenv("KNOWLEDGE_LLM_SEARCH_LIMIT", "40"))
+KNOWLEDGE_MAX_FILE_MB = int(os.getenv("KNOWLEDGE_MAX_FILE_MB", "20"))
+KNOWLEDGE_CHUNK_CHARS = int(os.getenv("KNOWLEDGE_CHUNK_CHARS", "1400"))
+KNOWLEDGE_CHUNK_OVERLAP = int(os.getenv("KNOWLEDGE_CHUNK_OVERLAP", "180"))
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
 PRIVACY_MODE = os.getenv("PRIVACY_MODE", "balanced").strip().lower()
 STT_PROVIDER = os.getenv("STT_PROVIDER", "local").strip().lower()
@@ -856,6 +867,293 @@ async def search_notes_contextual(
     except Exception:
         logger.warning("Ollama note rerank failed; using lexical search", exc_info=True)
         return lexical[:limit] if lexical else candidates[:limit]
+
+
+def supported_knowledge_suffixes() -> set[str]:
+    return {
+        ".txt",
+        ".md",
+        ".markdown",
+        ".csv",
+        ".json",
+        ".yaml",
+        ".yml",
+        ".log",
+        ".html",
+        ".htm",
+        ".xml",
+        ".pdf",
+        ".docx",
+    }
+
+
+def extract_text_from_file(path: Path, filename: str) -> str:
+    suffix = Path(filename).suffix.lower()
+    if suffix == ".pdf":
+        try:
+            from pypdf import PdfReader
+        except ImportError as exc:
+            raise RuntimeError("Для PDF установи зависимость: pip install pypdf") from exc
+        reader = PdfReader(str(path))
+        pages = []
+        for page in reader.pages:
+            pages.append(page.extract_text() or "")
+        return "\n\n".join(pages).strip()
+
+    if suffix == ".docx":
+        try:
+            from docx import Document
+        except ImportError as exc:
+            raise RuntimeError("Для DOCX установи зависимость: pip install python-docx") from exc
+        document = Document(str(path))
+        return "\n".join(paragraph.text for paragraph in document.paragraphs).strip()
+
+    raw = path.read_bytes()
+    for encoding in ("utf-8", "utf-8-sig", "cp1251", "latin-1"):
+        try:
+            return raw.decode(encoding).strip()
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="ignore").strip()
+
+
+def chunk_text(text: str, max_chars: int = KNOWLEDGE_CHUNK_CHARS, overlap: int = KNOWLEDGE_CHUNK_OVERLAP) -> list[str]:
+    import re
+
+    clean = re.sub(r"\r\n?", "\n", text)
+    clean = re.sub(r"\n{3,}", "\n\n", clean).strip()
+    if not clean:
+        return []
+
+    paragraphs = [part.strip() for part in re.split(r"\n\s*\n", clean) if part.strip()]
+    chunks: list[str] = []
+    current = ""
+    for paragraph in paragraphs:
+        if len(paragraph) > max_chars:
+            if current:
+                chunks.append(current.strip())
+                current = ""
+            start = 0
+            while start < len(paragraph):
+                chunks.append(paragraph[start : start + max_chars].strip())
+                start += max(1, max_chars - overlap)
+            continue
+
+        candidate = f"{current}\n\n{paragraph}".strip() if current else paragraph
+        if len(candidate) <= max_chars:
+            current = candidate
+        else:
+            if current:
+                chunks.append(current.strip())
+            current = paragraph
+
+    if current:
+        chunks.append(current.strip())
+    return chunks
+
+
+def add_knowledge_document(
+    chat_id: int,
+    user_id: int | None,
+    filename: str,
+    text: str,
+) -> dict[str, Any]:
+    chunks = chunk_text(text)
+    if not chunks:
+        raise ValueError("В файле не нашел текста для базы знаний.")
+
+    KNOWLEDGE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    document_id = f"kb-{int(datetime.now(ZoneInfo(TIMEZONE)).timestamp() * 1000)}"
+    created_at = now_iso()
+    with KNOWLEDGE_PATH.open("a", encoding="utf-8") as file:
+        for index, chunk in enumerate(chunks, start=1):
+            record = {
+                "id": f"{document_id}:{index}",
+                "document_id": document_id,
+                "chat_id": chat_id,
+                "user_id": user_id,
+                "filename": filename,
+                "chunk_index": index,
+                "chunk_count": len(chunks),
+                "text": chunk,
+                "created_at": created_at,
+            }
+            file.write(
+                json.dumps(
+                    {"v": 1, "cipher": encrypt_text(json.dumps(record, ensure_ascii=False))},
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+
+    return {
+        "document_id": document_id,
+        "filename": filename,
+        "chunk_count": len(chunks),
+        "created_at": created_at,
+    }
+
+
+def iter_knowledge_chunks(chat_id: int, user_id: int | None = None) -> list[dict[str, Any]]:
+    if not KNOWLEDGE_PATH.exists():
+        return []
+
+    chunks: list[dict[str, Any]] = []
+    with KNOWLEDGE_PATH.open("r", encoding="utf-8") as file:
+        for line in file:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                wrapper = json.loads(line)
+                chunk = json.loads(decrypt_text(str(wrapper["cipher"])))
+            except Exception:
+                logger.warning("Could not decrypt knowledge line", exc_info=True)
+                continue
+            if int(chunk.get("chat_id", 0)) != chat_id:
+                continue
+            if user_id is not None and chunk.get("user_id") not in (None, user_id):
+                continue
+            chunks.append(chunk)
+    return chunks
+
+
+def search_knowledge_chunks(chat_id: int, query: str, user_id: int | None = None, limit: int = 5) -> list[dict[str, Any]]:
+    expanded_query = expand_note_query(query)
+    ranked = []
+    for chunk in iter_knowledge_chunks(chat_id, user_id=user_id):
+        source_text = f"{chunk.get('filename', '')}\n{chunk.get('text', '')}"
+        score = note_score(expanded_query, source_text)
+        if score >= 20:
+            ranked.append((score, chunk))
+    ranked.sort(key=lambda item: (item[0], item[1].get("created_at", "")), reverse=True)
+    return [chunk | {"score": score} for score, chunk in ranked[:limit]]
+
+
+async def rerank_knowledge_with_ollama(query: str, chunks: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    if not KNOWLEDGE_LLM_SEARCH_ENABLED or not chunks:
+        return chunks[:limit]
+
+    numbered = []
+    for index, chunk in enumerate(chunks, start=1):
+        numbered.append(
+            {
+                "index": index,
+                "filename": chunk.get("filename"),
+                "chunk": str(chunk.get("text", ""))[:1200],
+            }
+        )
+
+    system_prompt = """
+You search a local encrypted knowledge base after chunks have been decrypted locally.
+Return JSON only. Pick chunks relevant to the user's query by meaning.
+Do not invent information. Prefer chunks that directly answer the query.
+Format:
+{"matches":[{"index":1,"score":95},{"index":2,"score":70}]}
+Use score 0-100. Return at most 5 matches.
+"""
+    payload = {
+        "model": OLLAMA_MODEL,
+        "format": "json",
+        "stream": False,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": json.dumps({"query": query, "chunks": numbered}, ensure_ascii=False),
+            },
+        ],
+        "options": {"temperature": 0.0, "num_ctx": 4096},
+    }
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        response = await client.post(f"{OLLAMA_URL}/api/chat", json=payload)
+        response.raise_for_status()
+        content = response.json()["message"]["content"]
+
+    data = json.loads(content)
+    ranked = []
+    for match in data.get("matches", []):
+        try:
+            index = int(match.get("index")) - 1
+            score = int(match.get("score", 0))
+        except Exception:
+            continue
+        if 0 <= index < len(chunks) and score >= 40:
+            chunk = dict(chunks[index])
+            chunk["score"] = max(int(chunk.get("score", 0)), score)
+            ranked.append(chunk)
+
+    if not ranked:
+        return chunks[:limit]
+    ranked.sort(key=lambda chunk: (int(chunk.get("score", 0)), chunk.get("created_at", "")), reverse=True)
+    return ranked[:limit]
+
+
+async def search_knowledge_contextual(
+    chat_id: int,
+    query: str,
+    user_id: int | None = None,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    lexical = search_knowledge_chunks(chat_id, query, user_id=user_id, limit=KNOWLEDGE_LLM_SEARCH_LIMIT)
+    recent = list(reversed(iter_knowledge_chunks(chat_id, user_id=user_id)))[:KNOWLEDGE_LLM_SEARCH_LIMIT]
+
+    seen = set()
+    candidates = []
+    for chunk in [*lexical, *recent]:
+        chunk_id = chunk.get("id")
+        if chunk_id in seen:
+            continue
+        seen.add(chunk_id)
+        candidates.append(chunk)
+
+    if not candidates:
+        return []
+
+    try:
+        return await rerank_knowledge_with_ollama(query, candidates, limit)
+    except Exception:
+        logger.warning("Ollama knowledge rerank failed; using lexical search", exc_info=True)
+        return lexical[:limit] if lexical else candidates[:limit]
+
+
+def infer_knowledge_query(text: str) -> str | None:
+    import re
+
+    lowered = text.lower()
+    if not any(marker in lowered for marker in ("баз", "знани", "файл", "документ")):
+        return None
+    if any(marker in lowered for marker in ("добав", "загру", "сохрани", "проиндекс")):
+        return None
+
+    patterns = (
+        r"(?:найди|покажи|достань|поищи)\s+(?:в\s+)?(?:базе\s+знаний|файлах|документах|базе)\s*(?:про|о|об|по)?\s*(.+)",
+        r"(?:что|какая|какие)\s+(?:в\s+)?(?:базе\s+знаний|файлах|документах|базе)\s*(?:про|о|об|по)?\s*(.+)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
+        if match:
+            query = match.group(1).strip(" \n\t:;?.!-—")
+            return query or None
+    return None
+
+
+def format_knowledge_results(query: str, chunks: list[dict[str, Any]]) -> str:
+    if not chunks:
+        return f"В базе знаний ничего не нашел по запросу: {query}"
+
+    lines = [f"База знаний: {query}"]
+    for index, chunk in enumerate(chunks, start=1):
+        text = " ".join(str(chunk.get("text", "")).split())
+        if len(text) > 700:
+            text = text[:697].rstrip() + "..."
+        lines.append(
+            f"{index}. {chunk.get('filename', 'file')} "
+            f"[{chunk.get('chunk_index')}/{chunk.get('chunk_count')}]"
+        )
+        lines.append(text)
+    return "\n\n".join(lines)
 
 
 def infer_note_create(text: str) -> str | None:
@@ -2748,6 +3046,31 @@ async def maybe_handle_notes(
     return False
 
 
+async def maybe_handle_knowledge_query(
+    text: str,
+    *,
+    chat_id: int,
+    user_id: int | None,
+    reply_target: Any,
+    debug_id: int | None,
+) -> bool:
+    query = infer_knowledge_query(text)
+    if not query:
+        return False
+
+    chunks = await search_knowledge_contextual(chat_id, query, user_id=user_id)
+    reply = format_knowledge_results(query, chunks)
+    store.update_debug_log(
+        debug_id,
+        intent_kind="knowledge_search",
+        intent_payload={"query": query, "count": len(chunks)},
+        result="replied",
+    )
+    await safe_reply_text(reply_target, reply)
+    store.add_memory_message(chat_id=chat_id, user_id=None, role="assistant", text=reply)
+    return True
+
+
 async def handle_text(
     text: str,
     update: Update,
@@ -2789,6 +3112,15 @@ async def handle_text(
         return
 
     if await maybe_handle_notes(
+        text,
+        chat_id=update.effective_chat.id,
+        user_id=update.effective_user.id,
+        reply_target=update.message,
+        debug_id=debug_id,
+    ):
+        return
+
+    if await maybe_handle_knowledge_query(
         text,
         chat_id=update.effective_chat.id,
         user_id=update.effective_user.id,
@@ -3344,6 +3676,46 @@ async def notes_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await safe_reply_text(update.message, "\n".join(lines))
 
 
+async def knowledge_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+    if not is_allowed(update):
+        await update.message.reply_text("Доступ к этому боту ограничен.")
+        return
+
+    user_id = update.effective_user.id if update.effective_user else None
+    query = " ".join(context.args).strip()
+    if query:
+        chunks = await search_knowledge_contextual(update.effective_chat.id, query, user_id=user_id)
+        await safe_reply_text(update.message, format_knowledge_results(query, chunks))
+        return
+
+    chunks = iter_knowledge_chunks(update.effective_chat.id, user_id=user_id)
+    documents: dict[str, dict[str, Any]] = {}
+    for chunk in chunks:
+        document_id = str(chunk.get("document_id"))
+        if document_id not in documents:
+            documents[document_id] = {
+                "filename": chunk.get("filename", "file"),
+                "created_at": chunk.get("created_at"),
+                "chunk_count": chunk.get("chunk_count", 0),
+            }
+
+    if not documents:
+        await safe_reply_text(
+            update.message,
+            "База знаний пока пустая. Пришли .txt/.md/.csv/.json/.pdf/.docx файлом в Telegram.",
+        )
+        return
+
+    lines = ["Файлы в базе знаний:"]
+    for index, doc in enumerate(sorted(documents.values(), key=lambda item: item.get("created_at", ""), reverse=True), start=1):
+        lines.append(
+            f"{index}. {doc['filename']} — {doc['chunk_count']} фрагм., {format_msk_dt(doc['created_at'])}"
+        )
+    await safe_reply_text(update.message, "\n".join(lines[:21]))
+
+
 async def memory_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_chat:
         return
@@ -3707,6 +4079,70 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        user_id = update.effective_user.id if update.effective_user else "unknown"
+        logger.warning("Blocked document message from user_id=%s", user_id)
+        if update.message:
+            await update.message.reply_text("Доступ к этому боту ограничен.")
+        return
+
+    if not update.message or not update.message.document or not update.effective_chat:
+        return
+
+    document = update.message.document
+    filename = document.file_name or "document"
+    suffix = Path(filename).suffix.lower()
+    if suffix not in supported_knowledge_suffixes():
+        await safe_reply_text(
+            update.message,
+            "Пока умею добавлять в базу знаний: txt, md, csv, json, yaml, log, html, xml, pdf, docx.",
+        )
+        return
+
+    max_bytes = KNOWLEDGE_MAX_FILE_MB * 1024 * 1024
+    if document.file_size and document.file_size > max_bytes:
+        await safe_reply_text(
+            update.message,
+            f"Файл слишком большой: лимит {KNOWLEDGE_MAX_FILE_MB} МБ.",
+        )
+        return
+
+    await safe_send_typing(context, update.effective_chat.id)
+    try:
+        telegram_file = await context.bot.get_file(document.file_id)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / filename
+            await telegram_file.download_to_drive(custom_path=str(path))
+            text = await asyncio.to_thread(extract_text_from_file, path, filename)
+        info = add_knowledge_document(
+            update.effective_chat.id,
+            update.effective_user.id if update.effective_user else None,
+            filename,
+            text,
+        )
+    except Exception as exc:
+        logger.exception("Knowledge file indexing failed")
+        await safe_reply_text(update.message, f"Не получилось добавить файл в базу знаний: {exc}")
+        return
+
+    reply = "\n".join(
+        [
+            "Файл добавлен в базу знаний.",
+            f"Название: {info['filename']}",
+            f"Фрагментов: {info['chunk_count']}",
+            "Теперь можно спросить: /kb <что найти>",
+        ]
+    )
+    store.add_action_history(
+        update.effective_chat.id,
+        "knowledge_add",
+        reply,
+        {"document_id": info["document_id"], "filename": filename},
+    )
+    await safe_reply_text(update.message, reply)
+
+
 async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if not query:
@@ -4052,6 +4488,8 @@ def main() -> None:
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("whoami", whoami))
     app.add_handler(CommandHandler("notes", notes_command))
+    app.add_handler(CommandHandler("kb", knowledge_command))
+    app.add_handler(CommandHandler("knowledge", knowledge_command))
     app.add_handler(CommandHandler("memory", memory_status))
     app.add_handler(CommandHandler("forget_today", forget_today))
     app.add_handler(CommandHandler("today", today))
@@ -4071,6 +4509,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(handle_reminder_delete_scope, pattern=r"^reminder_delete_scope:(today|tomorrow|date|all)$"))
     app.add_handler(CallbackQueryHandler(handle_confirmation, pattern=r"^(confirm|cancel):\d+$"))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Telegram local organizer bot started")
