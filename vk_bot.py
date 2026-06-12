@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import json
 import logging
 import os
@@ -9,6 +9,12 @@ from typing import Any
 import httpx
 from dotenv import load_dotenv
 
+from assistant_core.commands import (
+    build_knowledge_reply,
+    build_notes_reply,
+    build_reminders_reply,
+    resolve_help_section,
+)
 from assistant_core.ids import is_vk_chat_id, vk_identity, vk_peer_id
 import bot
 
@@ -115,7 +121,7 @@ class VkMessage:
         if kwargs.get("reply_markup"):
             text = (
                 f"{text}\n\n"
-                "VK: ответь `подтвердить`, чтобы выполнить действие, или `отмена`, чтобы отменить."
+                "VK: РѕС‚РІРµС‚СЊ `РїРѕРґС‚РІРµСЂРґРёС‚СЊ`, С‡С‚РѕР±С‹ РІС‹РїРѕР»РЅРёС‚СЊ РґРµР№СЃС‚РІРёРµ, РёР»Рё `РѕС‚РјРµРЅР°`, С‡С‚РѕР±С‹ РѕС‚РјРµРЅРёС‚СЊ."
             )
         await self.client.send_message(self.peer_id, text)
 
@@ -158,12 +164,12 @@ def latest_pending_action(chat_id: int, user_id: int) -> int | None:
 async def confirm_latest(update: VkUpdate, context: VkContext) -> None:
     action_id = latest_pending_action(update.effective_chat.id, update.effective_user.id)
     if action_id is None:
-        await update.message.reply_text("Нет действия для подтверждения.")
+        await update.message.reply_text("РќРµС‚ РґРµР№СЃС‚РІРёСЏ РґР»СЏ РїРѕРґС‚РІРµСЂР¶РґРµРЅРёСЏ.")
         return
 
     row = bot.store.pop_pending(action_id)
     if not row:
-        await update.message.reply_text("Это действие уже обработано или устарело.")
+        await update.message.reply_text("Р­С‚Рѕ РґРµР№СЃС‚РІРёРµ СѓР¶Рµ РѕР±СЂР°Р±РѕС‚Р°РЅРѕ РёР»Рё СѓСЃС‚Р°СЂРµР»Рѕ.")
         return
 
     parsed = json.loads(row["action_json"])
@@ -179,10 +185,10 @@ async def confirm_latest(update: VkUpdate, context: VkContext) -> None:
 async def cancel_latest(update: VkUpdate) -> None:
     action_id = latest_pending_action(update.effective_chat.id, update.effective_user.id)
     if action_id is None:
-        await update.message.reply_text("Нет действия для отмены.")
+        await update.message.reply_text("РќРµС‚ РґРµР№СЃС‚РІРёСЏ РґР»СЏ РѕС‚РјРµРЅС‹.")
         return
     bot.store.pop_pending(action_id)
-    await update.message.reply_text("Отменено.")
+    await update.message.reply_text("РћС‚РјРµРЅРµРЅРѕ.")
 
 
 async def schedule_vk_pending_reminders(app: VkApplication) -> None:
@@ -207,7 +213,7 @@ async def handle_vk_text(client: VkClient, app: VkApplication, peer_id: int, fro
     if not text.strip():
         return
     if not is_allowed_vk_user(from_id):
-        await client.send_message(peer_id, "Доступ к этому боту ограничен.")
+        await client.send_message(peer_id, "Р”РѕСЃС‚СѓРї Рє СЌС‚РѕРјСѓ Р±РѕС‚Сѓ РѕРіСЂР°РЅРёС‡РµРЅ.")
         logger.warning("Blocked VK message from user_id=%s", from_id)
         return
 
@@ -215,117 +221,67 @@ async def handle_vk_text(client: VkClient, app: VkApplication, peer_id: int, fro
     update = VkUpdate(client, peer_id, from_id, text.strip())
     context = VkContext(app)
 
-    if normalized in {"подтвердить", "да", "ок", "ok", "+"}:
+    if normalized in {"РїРѕРґС‚РІРµСЂРґРёС‚СЊ", "РґР°", "РѕРє", "ok", "+"}:
         await confirm_latest(update, context)
         return
-    if normalized in {"отмена", "отмени", "cancel", "-"}:
+    if normalized in {"РѕС‚РјРµРЅР°", "РѕС‚РјРµРЅРё", "cancel", "-"}:
         await cancel_latest(update)
         return
     if normalized.startswith("/whoami"):
         await update.message.reply_text(
             "\n".join(
                 [
-                    f"Ваш VK user id: {from_id}",
+                    f"Р’Р°С€ VK user id: {from_id}",
                     f"VK peer id: {peer_id}",
-                    f"Внутренний chat id: {update.effective_chat.id}",
+                    f"Р’РЅСѓС‚СЂРµРЅРЅРёР№ chat id: {update.effective_chat.id}",
                 ]
             )
         )
         return
     if normalized.startswith("/help"):
-        args = text.split()[1:]
-        section = args[0].lower() if args else "main"
-        aliases = {
-            "calendar": "calendar",
-            "календарь": "calendar",
-            "reminders": "reminders",
-            "напоминания": "reminders",
-            "voice": "voice",
-            "голос": "voice",
-            "memory": "memory",
-            "память": "memory",
-            "notes": "notes",
-            "заметки": "notes",
-            "knowledge": "knowledge",
-            "kb": "knowledge",
-            "база": "knowledge",
-        }
-        await update.message.reply_text(bot.capabilities_text(aliases.get(section, "main")))
-        return
-    if normalized.startswith("/reminders"):
-        args = text.split()[1:]
-        reminder_text = " ".join(args) if args else "сегодня"
-        parsed = bot.reminder_range_from_text(f"список напоминаний {reminder_text}")
-        if not parsed:
-            zone = bot.ZoneInfo(bot.TIMEZONE)
-            start, end = bot.day_bounds(bot.datetime.now(zone))
-            parsed = ("Дела и напоминания на сегодня:", start, end)
-        title, start, end = parsed
-        bot.export_reminders_markdown(update.effective_chat.id)
         await update.message.reply_text(
-            bot.format_reminders_for_range(update.effective_chat.id, title, start, end)
+            bot.capabilities_text(resolve_help_section(text.split()[1:]))
         )
         return
+    if normalized.startswith("/reminders"):
+        reply = build_reminders_reply(
+            chat_id=update.effective_chat.id,
+            args=text.split()[1:],
+            now=bot.datetime.now(bot.ZoneInfo(bot.TIMEZONE)),
+            reminder_range_from_text=bot.reminder_range_from_text,
+            day_bounds=bot.day_bounds,
+            export_reminders_markdown=bot.export_reminders_markdown,
+            format_reminders_for_range=bot.format_reminders_for_range,
+        )
+        await update.message.reply_text(reply)
+        return
     if normalized.startswith("/notes"):
-        query = " ".join(text.split()[1:]).strip()
-        if query:
-            notes = await bot.search_notes_contextual(
-                update.effective_chat.id,
-                query,
-                user_id=update.effective_user.id,
-            )
-            await update.message.reply_text(bot.format_note_results(query, notes))
-            return
-        notes = list(
-            reversed(
-                bot.iter_notes(
-                    update.effective_chat.id,
-                    user_id=update.effective_user.id,
-                )
-            )
-        )[:10]
-        if not notes:
-            await update.message.reply_text("Заметок пока нет. Напиши: сделай заметку <текст>.")
-            return
-        lines = ["Последние заметки:"]
-        for index, note in enumerate(notes, start=1):
-            lines.append(f"{index}. {bot.format_msk_dt(note['created_at'])} — {note['text']}")
-        await update.message.reply_text("\n".join(lines))
+        reply = await build_notes_reply(
+            chat_id=update.effective_chat.id,
+            user_id=update.effective_user.id,
+            args=text.split()[1:],
+            search_notes_contextual=bot.search_notes_contextual,
+            iter_notes=bot.iter_notes,
+            format_note_results=bot.format_note_results,
+            format_msk_dt=bot.format_msk_dt,
+        )
+        await update.message.reply_text(reply)
         return
     if normalized.startswith("/kb") or normalized.startswith("/knowledge"):
-        query = " ".join(text.split()[1:]).strip()
-        if query:
-            chunks = await bot.search_knowledge_contextual(
-                update.effective_chat.id,
-                query,
-                user_id=update.effective_user.id,
-            )
-            await update.message.reply_text(bot.format_knowledge_results(query, chunks))
-            return
-        chunks = bot.iter_knowledge_chunks(update.effective_chat.id, user_id=update.effective_user.id)
-        documents: dict[str, dict[str, Any]] = {}
-        for chunk in chunks:
-            document_id = str(chunk.get("document_id"))
-            if document_id not in documents:
-                documents[document_id] = {
-                    "filename": chunk.get("filename", "file"),
-                    "created_at": chunk.get("created_at"),
-                    "chunk_count": chunk.get("chunk_count", 0),
-                }
-        if not documents:
-            await update.message.reply_text(
-                "База знаний пока пустая. Добавление файлов через VK будет отдельным этапом; сейчас файлы добавляются через Telegram."
-            )
-            return
-        lines = ["Файлы в базе знаний:"]
-        for index, doc in enumerate(
-            sorted(documents.values(), key=lambda item: item.get("created_at", ""), reverse=True),
-            start=1,
-        ):
-            lines.append(
-                f"{index}. {doc['filename']} — {doc['chunk_count']} фрагм., {bot.format_msk_dt(doc['created_at'])}"
-            )
-        await update.message.reply_text("\n".join(lines[:21]))
+        reply = await build_knowledge_reply(
+            chat_id=update.effective_chat.id,
+            user_id=update.effective_user.id,
+            args=text.split()[1:],
+            empty_message=(
+                "Р‘Р°Р·Р° Р·РЅР°РЅРёР№ РїРѕРєР° РїСѓСЃС‚Р°СЏ. Р”РѕР±Р°РІР»РµРЅРёРµ С„Р°Р№Р»РѕРІ С‡РµСЂРµР· VK Р±СѓРґРµС‚ РѕС‚РґРµР»СЊРЅС‹Рј СЌС‚Р°РїРѕРј; "
+                "СЃРµР№С‡Р°СЃ С„Р°Р№Р»С‹ РґРѕР±Р°РІР»СЏСЋС‚СЃСЏ С‡РµСЂРµР· Telegram."
+            ),
+            search_knowledge_contextual=bot.search_knowledge_contextual,
+            iter_knowledge_chunks=bot.iter_knowledge_chunks,
+            format_knowledge_results=bot.format_knowledge_results,
+            format_msk_dt=bot.format_msk_dt,
+        )
+        await update.message.reply_text(reply)
         return
 
     await bot.handle_text(text, update, context, source="vk_text")

@@ -42,11 +42,17 @@ The core should own:
 
 This is not the final multi-tenant model. It is a safe compatibility bridge before adding real `users`, `workspaces`, and `channel_accounts` tables.
 
+`assistant_core.commands` contains the first shared command handlers for platform-neutral text replies:
+
+- help section resolution;
+- reminders list replies;
+- notes list/search replies;
+- knowledge base list/search replies.
+
 ## Next refactor steps
 
 1. Move text-response primitives into `assistant_core.messages`.
-2. Move command handlers that are already platform-neutral: help, reminders list, notes search, knowledge search.
-3. Move intent parsing and action execution behind one `AssistantCore.handle_text()` method.
+2. Move intent parsing and action execution behind one `AssistantCore.handle_text()` method.
+3. Replace transport-specific pending confirmation code with a shared confirmation service.
 4. Keep Telegram/VK/Web as thin adapters.
 5. Add real user/workspace tables before selling to multiple clients.
-

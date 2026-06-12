@@ -15,6 +15,12 @@ import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from cryptography.fernet import Fernet
 from dotenv import load_dotenv
+from assistant_core.commands import (
+    build_knowledge_reply,
+    build_notes_reply,
+    build_reminders_reply,
+    resolve_help_section,
+)
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
@@ -3634,26 +3640,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("Доступ к этому боту ограничен.")
         return
 
-    section = context.args[0].lower() if context.args else "main"
-    aliases = {
-        "calendar": "calendar",
-        "календарь": "calendar",
-        "reminders": "reminders",
-        "напоминания": "reminders",
-        "voice": "voice",
-        "голос": "voice",
-        "memory": "memory",
-        "knowledge": "knowledge",
-        "kb": "knowledge",
-        "база": "knowledge",
-        "база_знаний": "knowledge",
-        "notes": "notes",
-        "заметки": "notes",
-        "заметка": "notes",
-        "память": "memory",
-    }
     await update.message.reply_text(
-        capabilities_text(aliases.get(section, "main")),
+        capabilities_text(resolve_help_section(context.args)),
         reply_markup=capabilities_keyboard(),
     )
 
@@ -3679,22 +3667,16 @@ async def notes_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("Доступ к этому боту ограничен.")
         return
 
-    user_id = update.effective_user.id if update.effective_user else None
-    query = " ".join(context.args).strip()
-    if query:
-        notes = await search_notes_contextual(update.effective_chat.id, query, user_id=user_id)
-        await safe_reply_text(update.message, format_note_results(query, notes))
-        return
-
-    notes = list(reversed(iter_notes(update.effective_chat.id, user_id=user_id)))[:10]
-    if not notes:
-        await safe_reply_text(update.message, "Заметок пока нет. Скажи: сделай заметку <текст>.")
-        return
-
-    lines = ["Последние заметки:"]
-    for index, note in enumerate(notes, start=1):
-        lines.append(f"{index}. {format_msk_dt(note['created_at'])} — {note['text']}")
-    await safe_reply_text(update.message, "\n".join(lines))
+    reply = await build_notes_reply(
+        chat_id=update.effective_chat.id,
+        user_id=update.effective_user.id if update.effective_user else None,
+        args=context.args,
+        search_notes_contextual=search_notes_contextual,
+        iter_notes=iter_notes,
+        format_note_results=format_note_results,
+        format_msk_dt=format_msk_dt,
+    )
+    await safe_reply_text(update.message, reply)
 
 
 async def knowledge_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3704,37 +3686,17 @@ async def knowledge_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text("Доступ к этому боту ограничен.")
         return
 
-    user_id = update.effective_user.id if update.effective_user else None
-    query = " ".join(context.args).strip()
-    if query:
-        chunks = await search_knowledge_contextual(update.effective_chat.id, query, user_id=user_id)
-        await safe_reply_text(update.message, format_knowledge_results(query, chunks))
-        return
-
-    chunks = iter_knowledge_chunks(update.effective_chat.id, user_id=user_id)
-    documents: dict[str, dict[str, Any]] = {}
-    for chunk in chunks:
-        document_id = str(chunk.get("document_id"))
-        if document_id not in documents:
-            documents[document_id] = {
-                "filename": chunk.get("filename", "file"),
-                "created_at": chunk.get("created_at"),
-                "chunk_count": chunk.get("chunk_count", 0),
-            }
-
-    if not documents:
-        await safe_reply_text(
-            update.message,
-            "База знаний пока пустая. Пришли .txt/.md/.csv/.json/.pdf/.docx файлом в Telegram.",
-        )
-        return
-
-    lines = ["Файлы в базе знаний:"]
-    for index, doc in enumerate(sorted(documents.values(), key=lambda item: item.get("created_at", ""), reverse=True), start=1):
-        lines.append(
-            f"{index}. {doc['filename']} — {doc['chunk_count']} фрагм., {format_msk_dt(doc['created_at'])}"
-        )
-    await safe_reply_text(update.message, "\n".join(lines[:21]))
+    reply = await build_knowledge_reply(
+        chat_id=update.effective_chat.id,
+        user_id=update.effective_user.id if update.effective_user else None,
+        args=context.args,
+        empty_message="База знаний пока пустая. Пришли .txt/.md/.csv/.json/.pdf/.docx файлом в Telegram.",
+        search_knowledge_contextual=search_knowledge_contextual,
+        iter_knowledge_chunks=iter_knowledge_chunks,
+        format_knowledge_results=format_knowledge_results,
+        format_msk_dt=format_msk_dt,
+    )
+    await safe_reply_text(update.message, reply)
 
 
 async def memory_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3857,16 +3819,16 @@ async def reminders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Доступ к этому боту ограничен.")
         return
 
-    text = " ".join(context.args) if context.args else "сегодня"
-    parsed = reminder_range_from_text(f"список напоминаний {text}")
-    if not parsed:
-        zone = ZoneInfo(TIMEZONE)
-        start, end = day_bounds(datetime.now(zone))
-        parsed = ("Дела и напоминания на сегодня:", start, end)
-
-    title, start, end = parsed
-    export_reminders_markdown(update.effective_chat.id)
-    await safe_reply_text(update.message, format_reminders_for_range(update.effective_chat.id, title, start, end))
+    reply = build_reminders_reply(
+        chat_id=update.effective_chat.id,
+        args=context.args,
+        now=datetime.now(ZoneInfo(TIMEZONE)),
+        reminder_range_from_text=reminder_range_from_text,
+        day_bounds=day_bounds,
+        export_reminders_markdown=export_reminders_markdown,
+        format_reminders_for_range=format_reminders_for_range,
+    )
+    await safe_reply_text(update.message, reply)
 
 
 async def today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
