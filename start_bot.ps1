@@ -1,5 +1,6 @@
 param(
-    [switch]$RunBotInWsl
+    [switch]$RunBotInWsl,
+    [switch]$RunVk
 )
 
 $ErrorActionPreference = "Stop"
@@ -150,22 +151,38 @@ function Start-BotWindows {
     Write-Host "Installing Python dependencies..."
     & ".\.venv\Scripts\python.exe" -m pip install -r requirements.txt
 
-    Write-Host "Starting Telegram bot..."
-    & ".\.venv\Scripts\python.exe" bot.py
+    if ($RunVk) {
+        Write-Host "Starting VK bot..."
+        & ".\.venv\Scripts\python.exe" vk_bot.py
+    }
+    else {
+        Write-Host "Starting Telegram bot..."
+        & ".\.venv\Scripts\python.exe" bot.py
+    }
 }
 
 function Start-BotWsl {
     $wslPath = Convert-ToWslPath -WindowsPath $PSScriptRoot
+    $entrypoint = "bot.py"
+    if ($RunVk) {
+        $entrypoint = "vk_bot.py"
+    }
+
     $command = @"
 cd '$wslPath' &&
 if [ -d .venv-wsl ] && [ ! -f .venv-wsl/bin/activate ]; then rm -rf .venv-wsl; fi &&
 if [ ! -d .venv-wsl ]; then python3 -m venv .venv-wsl; fi &&
 . .venv-wsl/bin/activate &&
 pip install -r requirements.txt &&
-python bot.py
+python $entrypoint
 "@
 
-    Write-Host "Starting Telegram bot in WSL..."
+    if ($RunVk) {
+        Write-Host "Starting VK bot in WSL..."
+    }
+    else {
+        Write-Host "Starting Telegram bot in WSL..."
+    }
     & wsl bash -lc $command
 }
 
