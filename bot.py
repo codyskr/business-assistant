@@ -21,7 +21,8 @@ from assistant_core.commands import (
     build_reminders_reply,
     resolve_help_section,
 )
-from assistant_core.confirmations import create_pending_action, pop_pending_action
+from assistant_core.assistant import AssistantCore, AssistantCoreDeps, AssistantMessageContext
+from assistant_core.confirmations import pop_pending_action
 from assistant_core.executor import ActionExecutorDeps, execute_action as execute_core_action
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
@@ -3110,6 +3111,61 @@ async def maybe_handle_knowledge_query(
     return True
 
 
+def confirmation_markup(action_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Подтвердить", callback_data=f"confirm:{action_id}"),
+                InlineKeyboardButton("Отмена", callback_data=f"cancel:{action_id}"),
+            ]
+        ]
+    )
+
+
+async def core_send_typing(message_context: AssistantMessageContext, chat_id: int) -> None:
+    try:
+        await message_context.app.bot.send_chat_action(chat_id, ChatAction.TYPING)
+    except Exception:
+        logger.debug("Could not send typing action", exc_info=True)
+
+
+def assistant_core_deps() -> AssistantCoreDeps:
+    return AssistantCoreDeps(
+        store=store,
+        auto_confirm_actions=AUTO_CONFIRM_ACTIONS,
+        ollama_request_error=httpx.RequestError,
+        safe_reply_text=safe_reply_text,
+        safe_send_typing=core_send_typing,
+        capabilities_text=capabilities_text,
+        capabilities_markup=capabilities_keyboard,
+        confirmation_markup=confirmation_markup,
+        is_capabilities_question=is_capabilities_question,
+        maybe_handle_notes=maybe_handle_notes,
+        maybe_handle_knowledge_query=maybe_handle_knowledge_query,
+        reminder_range_from_text=reminder_range_from_text,
+        export_reminders_markdown=export_reminders_markdown,
+        format_reminders_for_range=format_reminders_for_range,
+        infer_calendar_list_range=infer_calendar_list_range,
+        list_calendar_events=list_calendar_events,
+        format_calendar_events=format_calendar_events,
+        infer_delete_reminders=infer_delete_reminders,
+        infer_delete_all_calendar_events=infer_delete_all_calendar_events,
+        infer_recurring_calendar_events=infer_recurring_calendar_events,
+        infer_hourly_countdown_reminders=infer_hourly_countdown_reminders,
+        infer_general_recurring_reminders=infer_general_recurring_reminders,
+        infer_recurring_task_reminders=infer_recurring_task_reminders,
+        infer_direct_reminder=infer_direct_reminder,
+        infer_task_reminder=infer_task_reminder,
+        ask_ollama_for_intent=ask_ollama_for_intent,
+        format_action=format_action,
+        execute_action=execute_action,
+    )
+
+
+def assistant_core() -> AssistantCore:
+    return AssistantCore(assistant_core_deps())
+
+
 async def handle_text(
     text: str,
     update: Update,
@@ -3121,232 +3177,19 @@ async def handle_text(
 ) -> None:
     if not update.message or not update.effective_user or not update.effective_chat:
         return
-    if debug_id is None:
-        debug_id = store.add_debug_log(
-            chat_id=update.effective_chat.id,
-            user_id=update.effective_user.id,
-            source=source,
-            stt_provider=stt_provider,
-            input_text=text,
-        )
 
-    store.add_memory_message(
-        chat_id=update.effective_chat.id,
-        user_id=update.effective_user.id,
-        role="user",
-        text=text,
-    )
-    await safe_send_typing(context, update.effective_chat.id)
-
-    if is_capabilities_question(text):
-        reply = capabilities_text()
-        store.update_debug_log(debug_id, intent_kind="capabilities", result="replied")
-        await safe_reply_text(update.message, reply, reply_markup=capabilities_keyboard())
-        store.add_memory_message(
-            chat_id=update.effective_chat.id,
-            user_id=None,
-            role="assistant",
-            text=reply,
-        )
-        return
-
-    if await maybe_handle_notes(
+    await assistant_core().handle_text(
         text,
-        chat_id=update.effective_chat.id,
-        user_id=update.effective_user.id,
-        reply_target=update.message,
-        debug_id=debug_id,
-    ):
-        return
-
-    if await maybe_handle_knowledge_query(
-        text,
-        chat_id=update.effective_chat.id,
-        user_id=update.effective_user.id,
-        reply_target=update.message,
-        debug_id=debug_id,
-    ):
-        return
-
-    reminder_range = reminder_range_from_text(text)
-    if reminder_range:
-        title, start, end = reminder_range
-        export_reminders_markdown(update.effective_chat.id)
-        reply = format_reminders_for_range(update.effective_chat.id, title, start, end)
-        store.update_debug_log(debug_id, intent_kind="reminder_list", result="replied")
-        await safe_reply_text(update.message, reply)
-        store.add_memory_message(
-            chat_id=update.effective_chat.id,
-            user_id=None,
-            role="assistant",
-            text=reply,
-        )
-        return
-
-    calendar_range = infer_calendar_list_range(text)
-    if calendar_range:
-        title, start, end = calendar_range
-        try:
-            events = await list_calendar_events(start, end, user_id=update.effective_user.id)
-            reply = format_calendar_events(events, title)
-            store.update_debug_log(debug_id, intent_kind="calendar_list", result="replied")
-        except Exception as exc:
-            logger.exception("Calendar listing failed")
-            reply = f"Не получилось прочитать календарь: {exc}"
-            store.update_debug_log(
-                debug_id,
-                intent_kind="calendar_list",
-                result="error",
-                error=str(exc),
-            )
-
-        await safe_reply_text(update.message, reply)
-        store.add_memory_message(
-            chat_id=update.effective_chat.id,
-            user_id=None,
-            role="assistant",
-            text=reply,
-        )
-        return
-
-    task_reminder = (
-        infer_delete_reminders(text)
-        or infer_delete_all_calendar_events(text)
-        or infer_recurring_calendar_events(text)
-        or infer_hourly_countdown_reminders(text)
-        or infer_general_recurring_reminders(text)
-        or infer_recurring_task_reminders(text)
-        or infer_direct_reminder(text)
-        or infer_task_reminder(text)
-    )
-    if task_reminder:
-        intent = ParsedIntent(
-            kind="reminder",
-            data=task_reminder,
-            reply=task_reminder["reply"],
-        )
-        store.update_debug_log(
-            debug_id,
-            intent_kind=intent.kind,
-            intent_payload=intent.data,
-            result="auto_confirm_execute" if AUTO_CONFIRM_ACTIONS else "pending_confirmation",
-        )
-        if AUTO_CONFIRM_ACTIONS:
-            await execute_action(
-                intent.data,
-                chat_id=update.effective_chat.id,
-                user_id=update.effective_user.id,
-                app=context.application,
-                reply_target=update.message,
-            )
-            return
-
-        action_id = create_pending_action(
-            store,
+        AssistantMessageContext(
             chat_id=update.effective_chat.id,
             user_id=update.effective_user.id,
-            action=intent.data,
-        )
-        reply = format_action(intent.data)
-        keyboard = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton("Подтвердить", callback_data=f"confirm:{action_id}"),
-                    InlineKeyboardButton("Отмена", callback_data=f"cancel:{action_id}"),
-                ]
-            ]
-        )
-        await safe_reply_text(update.message, reply, reply_markup=keyboard)
-        store.add_memory_message(
-            chat_id=update.effective_chat.id,
-            user_id=None,
-            role="assistant",
-            text=reply,
-        )
-        return
-
-    try:
-        intent = await ask_ollama_for_intent(text, update.effective_chat.id)
-    except httpx.RequestError:
-        store.update_debug_log(debug_id, result="error", error="ollama_request_error")
-        await safe_reply_text(update.message, "Не могу подключиться к Ollama. Проверьте, что ollama serve запущен.")
-        return
-    except Exception as exc:
-        logger.exception("Intent parsing failed")
-        store.update_debug_log(debug_id, result="error", error=str(exc))
-        await safe_reply_text(update.message, "Не смог разобрать запрос. Попробуйте сказать проще и с датой/временем.")
-        return
-
-    if intent.kind in {
-        "calendar_event",
-        "reminder",
-        "recurring_reminders",
-        "recurring_calendar_events",
-        "delete_calendar_event",
-        "delete_reminders",
-        "reschedule_calendar_event",
-    }:
-        action_summary = format_action(intent.data)
-        store.update_debug_log(
-            debug_id,
-            intent_kind=intent.kind,
-            intent_payload=intent.data,
-            result="auto_confirm_execute" if AUTO_CONFIRM_ACTIONS else "pending_confirmation",
-        )
-        store.add_action_history(
-            update.effective_chat.id,
-            intent.kind,
-            action_summary,
-            intent.data,
-        )
-        if AUTO_CONFIRM_ACTIONS:
-            await execute_action(
-                intent.data,
-                chat_id=update.effective_chat.id,
-                user_id=update.effective_user.id,
-                app=context.application,
-                reply_target=update.message,
-            )
-            return
-
-        action_id = create_pending_action(
-            store,
-            chat_id=update.effective_chat.id,
-            user_id=update.effective_user.id,
-            action=intent.data,
-        )
-        keyboard = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton("Подтвердить", callback_data=f"confirm:{action_id}"),
-                    InlineKeyboardButton("Отмена", callback_data=f"cancel:{action_id}"),
-                ]
-            ]
-        )
-        reply = action_summary
-        await safe_reply_text(update.message, reply, reply_markup=keyboard)
-        store.add_memory_message(
-            chat_id=update.effective_chat.id,
-            user_id=None,
-            role="assistant",
-            text=reply,
-        )
-        return
-
-    store.update_debug_log(
-        debug_id,
-        intent_kind=intent.kind,
-        intent_payload=intent.data,
-        result="chat_reply",
+            app=context.application,
+            reply_target=update.message,
+        ),
+        source=source,
+        stt_provider=stt_provider,
+        debug_id=debug_id,
     )
-    await safe_reply_text(update.message, intent.reply)
-    store.add_memory_message(
-        chat_id=update.effective_chat.id,
-        user_id=None,
-        role="assistant",
-        text=intent.reply,
-    )
-
 
 def action_executor_deps() -> ActionExecutorDeps:
     return ActionExecutorDeps(
@@ -4294,4 +4137,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 

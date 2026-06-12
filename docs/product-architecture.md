@@ -60,10 +60,14 @@ still dependency-injected from `bot.py`, so platform-specific UI and external
 services remain replaceable while Telegram and VK execute actions through the
 same path.
 
+`assistant_core.assistant` contains the first shared `AssistantCore.handle_text()`
+flow. Telegram and VK now pass normalized message context into the same text
+handling pipeline.
+
 ## Next refactor steps
 
 1. Move text-response primitives into `assistant_core.messages`.
-2. Move intent parsing behind one `AssistantCore.handle_text()` method.
-3. Split executor dependencies into calendar, reminders, and selection services.
+2. Split executor dependencies into calendar, reminders, and selection services.
+3. Move note and knowledge handlers out of `bot.py` into dedicated services.
 4. Keep Telegram/VK/Web as thin adapters.
 5. Add real user/workspace tables before selling to multiple clients.
