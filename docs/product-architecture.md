@@ -49,10 +49,16 @@ This is not the final multi-tenant model. It is a safe compatibility bridge befo
 - notes list/search replies;
 - knowledge base list/search replies.
 
+`assistant_core.confirmations` contains shared pending action primitives:
+
+- create pending action;
+- find latest pending action for text-based channels;
+- pop and decode pending action before execution.
+
 ## Next refactor steps
 
 1. Move text-response primitives into `assistant_core.messages`.
 2. Move intent parsing and action execution behind one `AssistantCore.handle_text()` method.
-3. Replace transport-specific pending confirmation code with a shared confirmation service.
+3. Move action execution services out of `bot.py` behind a platform-neutral executor.
 4. Keep Telegram/VK/Web as thin adapters.
 5. Add real user/workspace tables before selling to multiple clients.

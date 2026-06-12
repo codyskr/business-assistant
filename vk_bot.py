@@ -1,5 +1,4 @@
 ﻿import asyncio
-import json
 import logging
 import os
 import random
@@ -15,6 +14,7 @@ from assistant_core.commands import (
     build_reminders_reply,
     resolve_help_section,
 )
+from assistant_core.confirmations import latest_pending_action_id, pop_pending_action
 from assistant_core.ids import is_vk_chat_id, vk_identity, vk_peer_id
 import bot
 
@@ -146,50 +146,41 @@ class VkApplication:
         self.bot = VkBotApi(client)
 
 
-def latest_pending_action(chat_id: int, user_id: int) -> int | None:
-    with bot.store.connect() as conn:
-        row = conn.execute(
-            """
-            SELECT id
-            FROM pending_actions
-            WHERE chat_id = ? AND user_id = ?
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            (chat_id, user_id),
-        ).fetchone()
-    return int(row["id"]) if row else None
-
-
 async def confirm_latest(update: VkUpdate, context: VkContext) -> None:
-    action_id = latest_pending_action(update.effective_chat.id, update.effective_user.id)
+    action_id = latest_pending_action_id(
+        bot.store,
+        chat_id=update.effective_chat.id,
+        user_id=update.effective_user.id,
+    )
     if action_id is None:
-        await update.message.reply_text("РќРµС‚ РґРµР№СЃС‚РІРёСЏ РґР»СЏ РїРѕРґС‚РІРµСЂР¶РґРµРЅРёСЏ.")
+        await update.message.reply_text("Нет действия для подтверждения.")
         return
 
-    row = bot.store.pop_pending(action_id)
-    if not row:
-        await update.message.reply_text("Р­С‚Рѕ РґРµР№СЃС‚РІРёРµ СѓР¶Рµ РѕР±СЂР°Р±РѕС‚Р°РЅРѕ РёР»Рё СѓСЃС‚Р°СЂРµР»Рѕ.")
+    pending = pop_pending_action(bot.store, action_id)
+    if not pending:
+        await update.message.reply_text("Это действие уже обработано или устарело.")
         return
 
-    parsed = json.loads(row["action_json"])
     await bot.execute_action(
-        parsed,
-        chat_id=int(row["chat_id"]),
-        user_id=int(row["user_id"]) if row["user_id"] is not None else None,
+        pending.action,
+        chat_id=pending.chat_id,
+        user_id=pending.user_id,
         app=context.application,
         reply_target=update.message,
     )
 
 
 async def cancel_latest(update: VkUpdate) -> None:
-    action_id = latest_pending_action(update.effective_chat.id, update.effective_user.id)
+    action_id = latest_pending_action_id(
+        bot.store,
+        chat_id=update.effective_chat.id,
+        user_id=update.effective_user.id,
+    )
     if action_id is None:
-        await update.message.reply_text("РќРµС‚ РґРµР№СЃС‚РІРёСЏ РґР»СЏ РѕС‚РјРµРЅС‹.")
+        await update.message.reply_text("Нет действия для отмены.")
         return
-    bot.store.pop_pending(action_id)
-    await update.message.reply_text("РћС‚РјРµРЅРµРЅРѕ.")
-
+    pop_pending_action(bot.store, action_id)
+    await update.message.reply_text("Отменено.")
 
 async def schedule_vk_pending_reminders(app: VkApplication) -> None:
     for row in bot.store.list_pending_reminders():
@@ -213,7 +204,7 @@ async def handle_vk_text(client: VkClient, app: VkApplication, peer_id: int, fro
     if not text.strip():
         return
     if not is_allowed_vk_user(from_id):
-        await client.send_message(peer_id, "Р”РѕСЃС‚СѓРї Рє СЌС‚РѕРјСѓ Р±РѕС‚Сѓ РѕРіСЂР°РЅРёС‡РµРЅ.")
+        await client.send_message(peer_id, "Доступ к этому боту ограничен.")
         logger.warning("Blocked VK message from user_id=%s", from_id)
         return
 
@@ -221,19 +212,19 @@ async def handle_vk_text(client: VkClient, app: VkApplication, peer_id: int, fro
     update = VkUpdate(client, peer_id, from_id, text.strip())
     context = VkContext(app)
 
-    if normalized in {"РїРѕРґС‚РІРµСЂРґРёС‚СЊ", "РґР°", "РѕРє", "ok", "+"}:
+    if normalized in {"подтвердить", "да", "ок", "ok", "+"}:
         await confirm_latest(update, context)
         return
-    if normalized in {"РѕС‚РјРµРЅР°", "РѕС‚РјРµРЅРё", "cancel", "-"}:
+    if normalized in {"отмена", "отмени", "cancel", "-"}:
         await cancel_latest(update)
         return
     if normalized.startswith("/whoami"):
         await update.message.reply_text(
             "\n".join(
                 [
-                    f"Р’Р°С€ VK user id: {from_id}",
+                    f"Ваш VK user id: {from_id}",
                     f"VK peer id: {peer_id}",
-                    f"Р’РЅСѓС‚СЂРµРЅРЅРёР№ chat id: {update.effective_chat.id}",
+                    f"Внутренний chat id: {update.effective_chat.id}",
                 ]
             )
         )
@@ -273,8 +264,8 @@ async def handle_vk_text(client: VkClient, app: VkApplication, peer_id: int, fro
             user_id=update.effective_user.id,
             args=text.split()[1:],
             empty_message=(
-                "Р‘Р°Р·Р° Р·РЅР°РЅРёР№ РїРѕРєР° РїСѓСЃС‚Р°СЏ. Р”РѕР±Р°РІР»РµРЅРёРµ С„Р°Р№Р»РѕРІ С‡РµСЂРµР· VK Р±СѓРґРµС‚ РѕС‚РґРµР»СЊРЅС‹Рј СЌС‚Р°РїРѕРј; "
-                "СЃРµР№С‡Р°СЃ С„Р°Р№Р»С‹ РґРѕР±Р°РІР»СЏСЋС‚СЃСЏ С‡РµСЂРµР· Telegram."
+                "База знаний пока пустая. Добавление файлов через VK будет отдельным этапом; "
+                "сейчас файлы добавляются через Telegram."
             ),
             search_knowledge_contextual=bot.search_knowledge_contextual,
             iter_knowledge_chunks=bot.iter_knowledge_chunks,
@@ -285,7 +276,6 @@ async def handle_vk_text(client: VkClient, app: VkApplication, peer_id: int, fro
         return
 
     await bot.handle_text(text, update, context, source="vk_text")
-
 
 async def run() -> None:
     if not VK_GROUP_ID:
@@ -337,3 +327,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+

@@ -21,6 +21,7 @@ from assistant_core.commands import (
     build_reminders_reply,
     resolve_help_section,
 )
+from assistant_core.confirmations import create_pending_action, pop_pending_action
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
@@ -259,6 +260,20 @@ class Store:
             if row:
                 conn.execute("DELETE FROM pending_actions WHERE id = ?", (action_id,))
             return row
+
+    def latest_pending_action_id(self, chat_id: int, user_id: int) -> int | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id
+                FROM pending_actions
+                WHERE chat_id = ? AND user_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (chat_id, user_id),
+            ).fetchone()
+        return int(row["id"]) if row else None
 
     def add_reminder(self, chat_id: int, text: str, remind_at: str) -> int:
         with self.connect() as conn:
@@ -3225,7 +3240,8 @@ async def handle_text(
             )
             return
 
-        action_id = store.add_pending(
+        action_id = create_pending_action(
+            store,
             chat_id=update.effective_chat.id,
             user_id=update.effective_user.id,
             action=intent.data,
@@ -3292,7 +3308,8 @@ async def handle_text(
             )
             return
 
-        action_id = store.add_pending(
+        action_id = create_pending_action(
+            store,
             chat_id=update.effective_chat.id,
             user_id=update.effective_user.id,
             action=intent.data,
@@ -4126,6 +4143,14 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await safe_reply_text(update.message, reply)
 
 
+class EditMessageReplyTarget:
+    def __init__(self, query: Any) -> None:
+        self.query = query
+
+    async def reply_text(self, text: str, **kwargs: Any) -> None:
+        await self.query.edit_message_text(text, **kwargs)
+
+
 async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if not query:
@@ -4141,8 +4166,8 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
     action, raw_id = query.data.split(":", 1)
     action_id = int(raw_id)
 
-    row = store.pop_pending(action_id)
-    if not row:
+    pending = pop_pending_action(store, action_id)
+    if not pending:
         await query.edit_message_text("Это действие уже обработано или устарело.")
         return
 
@@ -4150,140 +4175,13 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.edit_message_text("Отменено.")
         return
 
-    parsed = json.loads(row["action_json"])
-    user_id = int(row["user_id"]) if row["user_id"] is not None else None
-
-    try:
-        if parsed["kind"] == "calendar_event":
-            link = await create_calendar_event(parsed, user_id=user_id)
-            await query.edit_message_text(calendar_event_summary(parsed, link))
-        elif parsed["kind"] == "reminder":
-            reminder = parsed["reminder"]
-            reminder_id = store.add_reminder(
-                chat_id=row["chat_id"],
-                text=reminder["text"],
-                remind_at=reminder["remind_at"],
-            )
-            await schedule_reminder(
-                context.application,
-                reminder_id,
-                row["chat_id"],
-                reminder["text"],
-                reminder["remind_at"],
-            )
-            export_reminders_markdown(row["chat_id"])
-            await query.edit_message_text(
-                "\n".join(
-                    [
-                        "Напоминание поставлено.",
-                        f"Когда: {format_msk_dt(reminder['remind_at'])}",
-                        f"Текст: {reminder['text']}",
-                    ]
-                )
-            )
-        elif parsed["kind"] == "recurring_reminders":
-            recurring = parsed["recurring_reminders"]
-            reminder_texts = recurring.get("texts") or []
-            for index, remind_at in enumerate(recurring["occurrences"]):
-                reminder_text = reminder_texts[index] if index < len(reminder_texts) else recurring["text"]
-                reminder_id = store.add_reminder(
-                    chat_id=row["chat_id"],
-                    text=reminder_text,
-                    remind_at=remind_at,
-                )
-                await schedule_reminder(
-                    context.application,
-                    reminder_id,
-                    row["chat_id"],
-                    reminder_text,
-                    remind_at,
-                )
-            export_reminders_markdown(row["chat_id"])
-            await query.edit_message_text(
-                "\n".join(
-                    [
-                        "Повторяющиеся напоминания поставлены.",
-                        f"Количество: {recurring['count']}",
-                        f"Первое: {format_msk_dt(recurring['occurrences'][0])}",
-                        f"Последнее: {format_msk_dt(recurring['occurrences'][-1])}",
-                    ]
-                )
-            )
-        elif parsed["kind"] == "recurring_calendar_events":
-            recurring = parsed["recurring_calendar_events"]
-            for occurrence in recurring["occurrences"]:
-                await create_calendar_event_from_fields(
-                    title=recurring["title"],
-                    start=occurrence["start"],
-                    end=occurrence["end"],
-                    description=recurring.get("description", ""),
-                    reminder_minutes=recurring.get("reminder_minutes"),
-                    user_id=user_id,
-                )
-            await query.edit_message_text(
-                "\n".join(
-                    [
-                        "Повторяющиеся события созданы.",
-                        f"Количество: {recurring['count']}",
-                        f"Первое: {format_msk_dt(recurring['occurrences'][0]['start'])}",
-                        f"Последнее: {format_msk_dt(recurring['occurrences'][-1]['start'])}",
-                        f"Напоминание: за {recurring['reminder_minutes']} мин.",
-                    ]
-                )
-            )
-        elif parsed["kind"] == "delete_calendar_event":
-            if parsed["delete_event"].get("delete_all"):
-                events = await find_calendar_events_limited(parsed, limit=100, user_id=user_id)
-                if not events:
-                    await query.edit_message_text("Не нашел подходящих событий в календаре.")
-                else:
-                    for event in events:
-                        await delete_calendar_event_by_id(event["id"], user_id=user_id)
-                    await query.edit_message_text(f"Удалено событий: {len(events)}")
-                return
-
-            events = await find_calendar_events(parsed, user_id=user_id)
-            if not events:
-                await query.edit_message_text("Не нашел подходящих событий в календаре.")
-            elif len(events) == 1:
-                event = events[0]
-                await delete_calendar_event_by_id(event["id"], user_id=user_id)
-                await query.edit_message_text(f"Событие удалено: {calendar_event_label(event)}")
-            else:
-                await query.edit_message_text("Нашел несколько событий. Выберите ниже.")
-                await ask_user_to_select_event(
-                    query.message,
-                    int(row["chat_id"]),
-                    "delete",
-                    events,
-                    parsed,
-                    "Какое событие удалить?",
-                )
-        elif parsed["kind"] == "reschedule_calendar_event":
-            delete_shape = {"delete_event": parsed["reschedule_event"]}
-            events = await find_calendar_events(delete_shape, user_id=user_id)
-            if not events:
-                await query.edit_message_text("Не нашел подходящих событий в календаре.")
-            elif len(events) == 1:
-                updated = await reschedule_calendar_event_by_payload(events[0], parsed, user_id=user_id)
-                await query.edit_message_text(f"Событие перенесено: {calendar_event_label(updated)}")
-            else:
-                await query.edit_message_text("Нашел несколько событий. Выберите ниже.")
-                await ask_user_to_select_event(
-                    query.message,
-                    int(row["chat_id"]),
-                    "reschedule",
-                    events,
-                    parsed,
-                    "Какое событие перенести?",
-                )
-        elif parsed["kind"] == "delete_reminders":
-            await execute_delete_reminders(parsed, int(row["chat_id"]), query.message)
-        else:
-            await query.edit_message_text("Неизвестный тип действия.")
-    except Exception as exc:
-        logger.exception("Action execution failed")
-        await query.edit_message_text(f"Не получилось выполнить действие: {exc}")
+    await execute_action(
+        pending.action,
+        chat_id=pending.chat_id,
+        user_id=pending.user_id,
+        app=context.application,
+        reply_target=EditMessageReplyTarget(query),
+    )
 
 
 async def handle_event_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
