@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import json
 import logging
 import mimetypes
@@ -22,6 +22,7 @@ from assistant_core.commands import (
     resolve_help_section,
 )
 from assistant_core.confirmations import create_pending_action, pop_pending_action
+from assistant_core.executor import ActionExecutorDeps, execute_action as execute_core_action
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
@@ -3347,6 +3348,26 @@ async def handle_text(
     )
 
 
+def action_executor_deps() -> ActionExecutorDeps:
+    return ActionExecutorDeps(
+        store=store,
+        safe_reply_text=safe_reply_text,
+        format_msk_dt=format_msk_dt,
+        calendar_event_summary=calendar_event_summary,
+        calendar_event_label=calendar_event_label,
+        create_calendar_event=create_calendar_event,
+        create_calendar_event_from_fields=create_calendar_event_from_fields,
+        find_calendar_events=find_calendar_events,
+        find_calendar_events_limited=find_calendar_events_limited,
+        delete_calendar_event_by_id=delete_calendar_event_by_id,
+        reschedule_calendar_event_by_payload=reschedule_calendar_event_by_payload,
+        schedule_reminder=schedule_reminder,
+        export_reminders_markdown=export_reminders_markdown,
+        ask_user_to_select_event=ask_user_to_select_event,
+        execute_delete_reminders=execute_delete_reminders,
+    )
+
+
 async def execute_action(
     parsed: dict[str, Any],
     chat_id: int,
@@ -3354,140 +3375,14 @@ async def execute_action(
     app: Application,
     reply_target: Any,
 ) -> None:
-    try:
-        if parsed["kind"] == "calendar_event":
-            link = await create_calendar_event(parsed, user_id=user_id)
-            await safe_reply_text(reply_target, calendar_event_summary(parsed, link))
-        elif parsed["kind"] == "reminder":
-            reminder = parsed["reminder"]
-            reminder_id = store.add_reminder(
-                chat_id=chat_id,
-                text=reminder["text"],
-                remind_at=reminder["remind_at"],
-            )
-            await schedule_reminder(
-                app,
-                reminder_id,
-                chat_id,
-                reminder["text"],
-                reminder["remind_at"],
-            )
-            export_reminders_markdown(chat_id)
-            await safe_reply_text(
-                reply_target,
-                "\n".join(
-                    [
-                        "Напоминание поставлено.",
-                        f"Когда: {format_msk_dt(reminder['remind_at'])}",
-                        f"Текст: {reminder['text']}",
-                    ]
-                )
-            )
-        elif parsed["kind"] == "recurring_reminders":
-            recurring = parsed["recurring_reminders"]
-            reminder_texts = recurring.get("texts") or []
-            for index, remind_at in enumerate(recurring["occurrences"]):
-                reminder_text = reminder_texts[index] if index < len(reminder_texts) else recurring["text"]
-                reminder_id = store.add_reminder(
-                    chat_id=chat_id,
-                    text=reminder_text,
-                    remind_at=remind_at,
-                )
-                await schedule_reminder(
-                    app,
-                    reminder_id,
-                    chat_id,
-                    reminder_text,
-                    remind_at,
-                )
-            export_reminders_markdown(chat_id)
-            await safe_reply_text(
-                reply_target,
-                "\n".join(
-                    [
-                        "Повторяющиеся напоминания поставлены.",
-                        f"Количество: {recurring['count']}",
-                        f"Первое: {format_msk_dt(recurring['occurrences'][0])}",
-                        f"Последнее: {format_msk_dt(recurring['occurrences'][-1])}",
-                    ]
-                )
-            )
-        elif parsed["kind"] == "recurring_calendar_events":
-            recurring = parsed["recurring_calendar_events"]
-            links = []
-            for occurrence in recurring["occurrences"]:
-                link = await create_calendar_event_from_fields(
-                    title=recurring["title"],
-                    start=occurrence["start"],
-                    end=occurrence["end"],
-                    description=recurring.get("description", ""),
-                    reminder_minutes=recurring.get("reminder_minutes"),
-                    user_id=user_id,
-                )
-                links.append(link)
-            await safe_reply_text(
-                reply_target,
-                "\n".join(
-                    [
-                        "Повторяющиеся события созданы.",
-                        f"Количество: {recurring['count']}",
-                        f"Первое: {format_msk_dt(recurring['occurrences'][0]['start'])}",
-                        f"Последнее: {format_msk_dt(recurring['occurrences'][-1]['start'])}",
-                        f"Напоминание: за {recurring['reminder_minutes']} мин.",
-                    ]
-                )
-            )
-        elif parsed["kind"] == "delete_calendar_event":
-            if parsed["delete_event"].get("delete_all"):
-                events = await find_calendar_events_limited(parsed, limit=100, user_id=user_id)
-                if not events:
-                    await safe_reply_text(reply_target, "Не нашел подходящих событий в календаре.")
-                else:
-                    for event in events:
-                        await delete_calendar_event_by_id(event["id"], user_id=user_id)
-                    await safe_reply_text(reply_target, f"Удалено событий: {len(events)}")
-                return
-
-            events = await find_calendar_events(parsed, user_id=user_id)
-            if not events:
-                await safe_reply_text(reply_target, "Не нашел подходящих событий в календаре.")
-            elif len(events) == 1:
-                event = events[0]
-                await delete_calendar_event_by_id(event["id"], user_id=user_id)
-                await safe_reply_text(reply_target, f"Событие удалено: {calendar_event_label(event)}")
-            else:
-                await ask_user_to_select_event(
-                    reply_target,
-                    chat_id,
-                    "delete",
-                    events,
-                    parsed,
-                    "Нашел несколько событий. Какое удалить?",
-                )
-        elif parsed["kind"] == "reschedule_calendar_event":
-            delete_shape = {"delete_event": parsed["reschedule_event"]}
-            events = await find_calendar_events(delete_shape, user_id=user_id)
-            if not events:
-                await safe_reply_text(reply_target, "Не нашел подходящих событий в календаре.")
-            elif len(events) == 1:
-                updated = await reschedule_calendar_event_by_payload(events[0], parsed, user_id=user_id)
-                await safe_reply_text(reply_target, f"Событие перенесено: {calendar_event_label(updated)}")
-            else:
-                await ask_user_to_select_event(
-                    reply_target,
-                    chat_id,
-                    "reschedule",
-                    events,
-                    parsed,
-                    "Нашел несколько событий. Какое перенести?",
-                )
-        elif parsed["kind"] == "delete_reminders":
-            await execute_delete_reminders(parsed, chat_id, reply_target)
-        else:
-            await safe_reply_text(reply_target, "Неизвестный тип действия.")
-    except Exception as exc:
-        logger.exception("Action execution failed")
-        await safe_reply_text(reply_target, f"Не получилось выполнить действие: {exc}")
+    await execute_core_action(
+        parsed,
+        chat_id=chat_id,
+        user_id=user_id,
+        app=app,
+        reply_target=reply_target,
+        deps=action_executor_deps(),
+    )
 
 async def ask_user_to_select_event(
     reply_target: Any,
@@ -4399,3 +4294,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

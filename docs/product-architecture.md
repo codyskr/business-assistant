@@ -55,10 +55,15 @@ This is not the final multi-tenant model. It is a safe compatibility bridge befo
 - find latest pending action for text-based channels;
 - pop and decode pending action before execution.
 
+`assistant_core.executor` contains the first shared action execution flow. It is
+still dependency-injected from `bot.py`, so platform-specific UI and external
+services remain replaceable while Telegram and VK execute actions through the
+same path.
+
 ## Next refactor steps
 
 1. Move text-response primitives into `assistant_core.messages`.
-2. Move intent parsing and action execution behind one `AssistantCore.handle_text()` method.
-3. Move action execution services out of `bot.py` behind a platform-neutral executor.
+2. Move intent parsing behind one `AssistantCore.handle_text()` method.
+3. Split executor dependencies into calendar, reminders, and selection services.
 4. Keep Telegram/VK/Web as thin adapters.
 5. Add real user/workspace tables before selling to multiple clients.
